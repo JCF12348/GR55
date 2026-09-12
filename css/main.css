@@ -1320,6 +1320,14 @@ body.dark-mode .log-container .action { color: #9eabb8; }
     padding-bottom: 2px;
 }
 
+.display-control,
+.display-control-inline,
+.display-control .compact-field {
+    display: contents;
+}
+
+.mobile-week-label { display: none; }
+
 .command-group { padding-top: 12px; border-top: 1px solid #e5eaf0; }
 .command-group #cmdTXT { flex: 1 1 420px; }
 
@@ -1572,6 +1580,68 @@ body.custom-background .log-container { background: rgba(24,33,44,.94); }
     #display-panel > .flex-container:first-of-type > .flex-group:first-child { grid-template-columns: 1fr 1fr; }
     #display-panel > .flex-container:first-of-type > .flex-group:first-child > label { grid-column: 1 / -1; margin-top: 4px; }
     #display-panel > .flex-container:first-of-type > .flex-group:first-child > select { grid-column: 1 / -1; width: 100%; }
+    #display-panel .week-control {
+        display: grid;
+        grid-column: 2;
+        grid-row: 2;
+        grid-template-columns: auto minmax(0, 1fr);
+        align-items: center;
+        gap: 6px;
+        min-width: 0;
+        width: 100%;
+    }
+    #display-panel #clearscreenbutton {
+        grid-column: 1;
+        grid-row: 2;
+    }
+    #display-panel .week-control label { display: none; }
+    #display-panel .week-control .mobile-week-label {
+        display: block;
+        color: var(--text-muted);
+        font-size: 12px;
+        font-weight: 650;
+        white-space: nowrap;
+    }
+    #display-panel .week-control #weekStart {
+        width: 100%;
+        min-width: 0;
+        margin-bottom: 0;
+    }
+    #display-panel .theme-control {
+        display: grid;
+        grid-column: 1 / -1;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 8px;
+        width: 100%;
+    }
+    #display-panel .theme-control > label { margin-top: 4px; }
+    #display-panel .theme-control .display-control-inline {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+        width: 100%;
+    }
+    #display-panel .theme-control #calendarTheme { width: 100%; }
+    #display-panel .theme-control #calendarThemeButton {
+        min-width: 104px;
+        min-height: 38px;
+        height: 38px;
+    }
+    #display-panel .led-select-control {
+        display: grid;
+        grid-column: 1 / -1;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+        width: 100%;
+    }
+    #display-panel .led-select-control .compact-field {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 6px;
+        min-width: 0;
+    }
+    #display-panel .led-select-control label { margin-top: 4px; }
+    #display-panel .led-select-control select { width: 100%; min-width: 0; }
     .command-group { grid-template-columns: 1fr; }
     .command-group button { width: 100%; }
     .ota-controls { align-items: stretch; flex-direction: column; }
@@ -1595,11 +1665,6 @@ body.custom-background .log-container { background: rgba(24,33,44,.94); }
     align-items: center;
     gap: 8px;
     min-width: 228px;
-}
-
-/* Development visibility must not change the slider row layout. */
-.editor-mode #image-panel .image-range-group.debug {
-    display: grid !important;
 }
 
 #image-panel .image-range-group > label {

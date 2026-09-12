@@ -77,41 +77,54 @@
 					<button id="calendarmodebutton" type="button" class="primary" onclick="syncTime(1)">日历模式</button>
 					<button id="clockmodebutton" type="button" class="primary" onclick="syncTime(2)">时钟模式</button>
 					<button id="clearscreenbutton" type="button" class="secondary" onclick="clearScreen()">清除屏幕</button>
-					<label for="calendarTheme">日历主题</label>
-					<select id="calendarTheme">
-						<option value="0">标准布局</option>
-						<option value="1" selected>分栏大日期</option>
-						<option value="2">经典月历</option>
-						<option value="3">日期双栏</option>
-						<option value="4">一周焦点</option>
-						<option value="5">极简日历</option>
-					</select>
-					<button id="calendarThemeButton" type="button" class="secondary" onclick="applyCalendarTheme()">切换主题</button>
-					<label for="weekStart">每周开始于</label>
-					<select id="weekStart" onchange="setWeekStart(this.value)">
-						<option value="0" selected>星期日</option>
-						<option value="1">星期一</option>
-						<option value="2">星期二</option>
-						<option value="3">星期三</option>
-						<option value="4">星期四</option>
-						<option value="5">星期五</option>
-						<option value="6">星期六</option>
-					</select>
-					<label for="ledBoardRevision">LED 板型</label>
-					<select id="ledBoardRevision" onchange="applyLedSelection()">
-						<option value="12">V1.2</option>
-						<option value="11" selected>V1.1</option>
-					</select>
-					<label for="ledColor">颜色</label>
-					<select id="ledColor" onchange="applyLedSelection()">
-						<option value="1">红色</option>
-						<option value="2">绿色</option>
-						<option value="4" selected>蓝色</option>
-						<option value="3">黄色</option>
-						<option value="6">青色</option>
-						<option value="5">紫色</option>
-						<option value="7">白色</option>
-					</select>
+					<div class="display-control theme-control">
+						<label for="calendarTheme">日历主题</label>
+						<div class="display-control-inline">
+							<select id="calendarTheme">
+								<option value="0">标准布局</option>
+								<option value="1" selected>分栏大日期</option>
+								<option value="2">经典月历</option>
+								<option value="3">日期双栏</option>
+								<option value="4">一周焦点</option>
+								<option value="5">极简日历</option>
+							</select>
+							<button id="calendarThemeButton" type="button" class="secondary" onclick="applyCalendarTheme()">切换主题</button>
+						</div>
+					</div>
+					<div class="display-control week-control">
+						<label for="weekStart">每周开始于</label>
+						<span class="mobile-week-label" aria-hidden="true">周起始</span>
+						<select id="weekStart" onchange="setWeekStart(this.value)">
+							<option value="0" selected>星期日</option>
+							<option value="1">星期一</option>
+							<option value="2">星期二</option>
+							<option value="3">星期三</option>
+							<option value="4">星期四</option>
+							<option value="5">星期五</option>
+							<option value="6">星期六</option>
+						</select>
+					</div>
+					<div class="display-control led-select-control">
+						<div class="compact-field">
+							<label for="ledBoardRevision">LED 板型</label>
+							<select id="ledBoardRevision" onchange="applyLedSelection()">
+								<option value="12">V1.2</option>
+								<option value="11" selected>V1.1</option>
+							</select>
+						</div>
+						<div class="compact-field">
+							<label for="ledColor">颜色</label>
+							<select id="ledColor" onchange="applyLedSelection()">
+								<option value="1">红色</option>
+								<option value="2">绿色</option>
+								<option value="4" selected>蓝色</option>
+								<option value="3">黄色</option>
+								<option value="6">青色</option>
+								<option value="5">紫色</option>
+								<option value="7">白色</option>
+							</select>
+						</div>
+					</div>
 					<button id="ledToggleButton" type="button" class="secondary" onclick="toggleLed()">LED 开</button>
 					<button id="ledBrightnessButton" type="button" class="secondary" aria-expanded="false" onclick="toggleLedBrightness()">亮度</button>
 					<div id="ledBrightnessPanel" class="flex-group" hidden>
@@ -253,12 +266,12 @@
 					<input type="range" min="0.5" max="2" step="0.1" value="1.2" id="ditherContrast">
 					<label id="ditherContrastValue">1.2</label>
 				</div>
-				<div class="flex-group debug image-range-group">
+				<div class="flex-group image-range-group">
 					<label for="ditherBrightness">亮度:</label>
 					<input type="range" min="0.5" max="1.5" step="0.1" value="1.0" id="ditherBrightness">
 					<label id="ditherBrightnessValue">1.0</label>
 				</div>
-				<div class="flex-group debug image-range-group">
+				<div class="flex-group image-range-group">
 					<label for="ditherSaturation">饱和度:</label>
 					<input type="range" min="0" max="2" step="0.1" value="1.0" id="ditherSaturation">
 					<label id="ditherSaturationValue">1.0</label>
