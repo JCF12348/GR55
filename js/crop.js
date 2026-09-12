@@ -1,219 +1,344 @@
 class CropManager {
-  constructor(canvas, ctx) {
+  constructor(canvas, ctx, paintManager = null) {
     this.canvas = canvas;
     this.ctx = ctx;
-    this.backgroundZoom = 1;
-    this.backgroundPanX = 0;
-    this.backgroundPanY = 0;
+    this.paintManager = paintManager;
+    this.originalImage = null;
+    this.imageScale = 1;
+    this.imageOffsetX = 0;
+    this.imageOffsetY = 0;
+    this.currentRotation = 0;
+    this.minScale = 0.1;
+    this.maxScale = 5;
     this.isPanning = false;
-    this.lastPanX = 0;
-    this.lastPanY = 0;
+    this.lastPointerX = 0;
+    this.lastPointerY = 0;
     this.lastTouchDistance = 0;
+    this.renderCallback = null;
+    this.loadVersion = 0;
+    this.animationFrame = 0;
+    this.commitTimer = 0;
+    this.interactiveDirty = false;
 
-    // Bind event handlers
-    this.handleBackgroundZoom = this.handleBackgroundZoom.bind(this);
-    this.handleBackgroundPanStart = this.handleBackgroundPanStart.bind(this);
-    this.handleBackgroundPan = this.handleBackgroundPan.bind(this);
-    this.handleBackgroundPanEnd = this.handleBackgroundPanEnd.bind(this);
+    this.handleMouseDown = this.handleMouseDown.bind(this);
+    this.handleMouseMove = this.handleMouseMove.bind(this);
+    this.handleMouseUp = this.handleMouseUp.bind(this);
+    this.handleWheel = this.handleWheel.bind(this);
     this.handleTouchStart = this.handleTouchStart.bind(this);
     this.handleTouchMove = this.handleTouchMove.bind(this);
+    this.handleTouchEnd = this.handleTouchEnd.bind(this);
+  }
+
+  setRenderCallback(callback) {
+    this.renderCallback = typeof callback === 'function' ? callback : null;
+  }
+
+  hasImage() {
+    return this.originalImage !== null;
+  }
+
+  canTransform() {
+    if (!this.originalImage) return false;
+    if (!this.paintManager) return true;
+    if (this.paintManager.currentTool) return false;
+    return !this.paintManager.hasOverlayElements || !this.paintManager.hasOverlayElements();
   }
 
   resetStates() {
-    this.backgroundZoom = 1;
-    this.backgroundPanX = 0;
-    this.backgroundPanY = 0;
+    this.imageScale = 1;
+    this.imageOffsetX = 0;
+    this.imageOffsetY = 0;
+    this.currentRotation = 0;
     this.isPanning = false;
-    this.lastPanX = 0;
-    this.lastPanY = 0;
+    this.lastPointerX = 0;
+    this.lastPointerY = 0;
     this.lastTouchDistance = 0;
   }
 
-  isCropMode() {
-    return this.canvas.parentNode.classList.contains('crop-mode');
+  setControlsEnabled(enabled) {
+    ['rotate-left', 'rotate-right', 'zoom-out-image', 'zoom-in-image', 'reset-transform'].forEach((id) => {
+      const button = document.getElementById(id);
+      if (button) button.disabled = !enabled;
+    });
   }
 
-  exitCropMode() {
-    this.canvas.parentNode.classList.remove('crop-mode');
-    setCanvasTitle("");
-
-    this.canvas.removeEventListener('wheel', this.handleBackgroundZoom);
-    this.canvas.removeEventListener('mousedown', this.handleBackgroundPanStart);
-    this.canvas.removeEventListener('mousemove', this.handleBackgroundPan);
-    this.canvas.removeEventListener('mouseup', this.handleBackgroundPanEnd);
-    this.canvas.removeEventListener('mouseleave', this.handleBackgroundPanEnd);
-    this.canvas.removeEventListener('touchstart', this.handleTouchStart);
-    this.canvas.removeEventListener('touchmove', this.handleTouchMove);
-    this.canvas.removeEventListener('touchend', this.handleBackgroundPanEnd);
-    this.canvas.removeEventListener('touchcancel', this.handleBackgroundPanEnd);
+  refreshInteractionState() {
+    const enabled = this.canTransform();
+    this.canvas.parentNode.classList.toggle('image-transform-locked', this.hasImage() && !enabled);
+    this.setControlsEnabled(enabled);
   }
 
-  initializeCrop() {
-    const imageFile = document.getElementById('imageFile');
-    if (imageFile.files.length == 0) {
-      fillCanvas('white');
-      return;
-    }
+  loadFile(file) {
+    if (!file) return Promise.resolve(false);
+    const loadVersion = ++this.loadVersion;
 
-    this.exitCropMode();
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      const objectUrl = URL.createObjectURL(file);
+      image.onload = () => {
+        URL.revokeObjectURL(objectUrl);
+        if (loadVersion !== this.loadVersion) {
+          resolve(false);
+          return;
+        }
+        try {
+          this.originalImage = image;
+          this.canvas.parentNode.classList.add('image-transform-mode');
+          this.refreshInteractionState();
+          this.resetTransform(true);
+          resolve(true);
+        } catch (error) {
+          this.clearImage();
+          reject(error);
+        }
+      };
+      image.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        if (loadVersion !== this.loadVersion) {
+          resolve(false);
+          return;
+        }
+        reject(new Error('图片文件无法读取'));
+      };
+      image.src = objectUrl;
+    });
+  }
+
+  clearImage() {
+    this.loadVersion++;
+    if (this.animationFrame) cancelAnimationFrame(this.animationFrame);
+    if (this.commitTimer) clearTimeout(this.commitTimer);
+    this.animationFrame = 0;
+    this.commitTimer = 0;
+    this.interactiveDirty = false;
+    this.originalImage = null;
     this.resetStates();
+    this.canvas.classList.remove('grabbing');
+    this.canvas.parentNode.classList.remove('image-transform-mode');
+    this.canvas.parentNode.classList.remove('image-transform-locked');
+    this.setControlsEnabled(false);
+  }
 
-    this.canvas.style.backgroundImage = `url(${URL.createObjectURL(imageFile.files[0])})`;
-    this.canvas.style.backgroundSize = '100%';
-    this.canvas.style.backgroundPosition = '';
-    this.canvas.style.backgroundRepeat = 'no-repeat';
+  resetTransform(commitHistory = true) {
+    if (!this.originalImage) return false;
+    this.imageScale = Math.min(
+      this.maxScale,
+      Math.max(
+        this.minScale,
+        Math.max(
+          this.canvas.width / this.originalImage.width,
+          this.canvas.height / this.originalImage.height
+        )
+      )
+    );
+    this.imageOffsetX = 0;
+    this.imageOffsetY = 0;
+    this.currentRotation = 0;
+    this.redraw(commitHistory);
+    return true;
+  }
 
-    // add event listeners for zoom and pan
-    this.canvas.addEventListener('wheel', this.handleBackgroundZoom);
-    this.canvas.addEventListener('mousedown', this.handleBackgroundPanStart);
-    this.canvas.addEventListener('mousemove', this.handleBackgroundPan);
-    this.canvas.addEventListener('mouseup', this.handleBackgroundPanEnd);
-    this.canvas.addEventListener('mouseleave', this.handleBackgroundPanEnd);
+  rotateImage(degrees) {
+    if (!this.canTransform()) return false;
+    this.currentRotation = (this.currentRotation + degrees) % 360;
+    this.redraw(true);
+    return true;
+  }
 
-    // Touch events for mobile devices
-    this.canvas.addEventListener('touchstart', this.handleTouchStart);
-    this.canvas.addEventListener('touchmove', this.handleTouchMove);
-    this.canvas.addEventListener('touchend', this.handleBackgroundPanEnd);
-    this.canvas.addEventListener('touchcancel', this.handleBackgroundPanEnd);
+  zoomImage(factor, commitHistory = false) {
+    if (!this.canTransform()) return false;
+    const nextScale = Math.max(this.minScale, Math.min(this.maxScale, this.imageScale * factor));
+    if (Math.abs(nextScale - this.imageScale) < 0.0001) return false;
+    this.imageScale = nextScale;
+    if (commitHistory) this.redraw(true);
+    else this.queueInteractiveRedraw();
+    return true;
+  }
 
-    // Make the canvas transparent
+  drawTransformedImage() {
+    if (!this.originalImage) return;
+
+    this.ctx.save();
+    this.ctx.setTransform(1, 0, 0, 1, 0, 0);
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-
-    setCanvasTitle("裁剪模式: 可用鼠标滚轮或双指触摸缩放图片");
-    this.canvas.parentNode.classList.add('crop-mode');
+    this.ctx.fillStyle = '#ffffff';
+    this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    this.ctx.translate(this.canvas.width / 2, this.canvas.height / 2);
+    this.ctx.rotate(this.currentRotation * Math.PI / 180);
+    const width = this.originalImage.width * this.imageScale;
+    const height = this.originalImage.height * this.imageScale;
+    this.ctx.drawImage(
+      this.originalImage,
+      -width / 2 + this.imageOffsetX,
+      -height / 2 + this.imageOffsetY,
+      width,
+      height
+    );
+    this.ctx.restore();
   }
 
-  finishCrop(callback) {
-    const imageFile = document.getElementById('imageFile');
-    if (imageFile.files.length == 0) return;
+  redraw(commitHistory = false) {
+    if (!this.originalImage) return;
+    if (this.animationFrame) cancelAnimationFrame(this.animationFrame);
+    if (this.commitTimer) clearTimeout(this.commitTimer);
+    this.animationFrame = 0;
+    this.commitTimer = 0;
+    this.interactiveDirty = false;
 
-    const image = new Image();
-    image.onload = () => {
-      URL.revokeObjectURL(image.src);
+    this.drawTransformedImage();
+    const sourceImageData = this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
+    if (this.renderCallback) this.renderCallback(sourceImageData, commitHistory);
+  }
 
-      const fieldsetRect = this.canvas.getBoundingClientRect();
-      const scale = (image.width / fieldsetRect.width) / this.backgroundZoom;
+  queueInteractiveRedraw() {
+    if (!this.originalImage) return;
+    this.interactiveDirty = true;
+    if (this.animationFrame) return;
+    this.animationFrame = requestAnimationFrame(() => {
+      this.animationFrame = 0;
+      this.drawTransformedImage();
+    });
+  }
 
-      const sx = -this.backgroundPanX * scale;
-      const sy = -this.backgroundPanY * scale;
-      const sWidth = fieldsetRect.width * scale;
-      const sHeight = fieldsetRect.height * scale;
+  scheduleTransformCommit() {
+    if (this.commitTimer) clearTimeout(this.commitTimer);
+    this.commitTimer = setTimeout(() => {
+      this.commitTimer = 0;
+      this.commitPendingTransform(true);
+    }, 90);
+  }
 
-      fillCanvas('white');
-      this.ctx.drawImage(image, sx, sy, sWidth, sHeight, 0, 0, this.canvas.width, this.canvas.height);
+  commitPendingTransform(commitHistory = false) {
+    if (!this.originalImage || !this.interactiveDirty) return false;
+    this.redraw(commitHistory);
+    return true;
+  }
 
-      this.exitCropMode();
-      if (callback) callback();
+  getCanvasDelta(deltaX, deltaY) {
+    const rect = this.canvas.getBoundingClientRect();
+    const scaledX = rect.width > 0 ? deltaX * this.canvas.width / rect.width : deltaX;
+    const scaledY = rect.height > 0 ? deltaY * this.canvas.height / rect.height : deltaY;
+    const radians = this.currentRotation * Math.PI / 180;
+    return {
+      x: scaledX * Math.cos(radians) + scaledY * Math.sin(radians),
+      y: -scaledX * Math.sin(radians) + scaledY * Math.cos(radians)
     };
-    image.src = URL.createObjectURL(imageFile.files[0]);
   }
 
-  handleTouchStart(e) {
-    e.preventDefault();
-    if (e.touches.length === 1) {
-      this.handleBackgroundPanStart(e.touches[0]);
-    } else if (e.touches.length === 2) {
-      this.isPanning = false; // Stop panning when zooming
-      this.lastTouchDistance = this.getTouchDistance(e.touches);
-    }
-  }
-
-  handleTouchMove(e) {
-    e.preventDefault();
-    if (this.isPanning && e.touches.length === 1) {
-      this.handleBackgroundPan(e.touches[0]);
-    } else if (e.touches.length === 2) {
-      const newDist = this.getTouchDistance(e.touches);
-      if (this.lastTouchDistance > 0) {
-        const zoomFactor = newDist / this.lastTouchDistance;
-        this.backgroundZoom *= zoomFactor;
-        this.backgroundZoom = Math.max(0.1, Math.min(5, this.backgroundZoom)); // Limit zoom range
-        this.updateBackgroundTransform();
-      }
-      this.lastTouchDistance = newDist;
-    }
-  }
-
-  handleBackgroundZoom(e) {
-    e.preventDefault();
-    const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
-    this.backgroundZoom *= zoomFactor;
-    this.backgroundZoom = Math.max(0.1, Math.min(5, this.backgroundZoom)); // Limit zoom range
-    this.updateBackgroundTransform();
-  }
-
-  handleBackgroundPanStart(e) {
+  beginPan(clientX, clientY) {
+    if (!this.canTransform()) return false;
     this.isPanning = true;
-    this.lastPanX = e.clientX;
-    this.lastPanY = e.clientY;
-    this.canvas.style.cursor = 'grabbing';
+    this.lastPointerX = clientX;
+    this.lastPointerY = clientY;
+    this.canvas.classList.add('grabbing');
+    return true;
   }
 
-  handleBackgroundPan(e) {
-    if (this.isPanning) {
-      const deltaX = e.clientX - this.lastPanX;
-      const deltaY = e.clientY - this.lastPanY;
-      this.backgroundPanX += deltaX;
-      this.backgroundPanY += deltaY;
-      this.lastPanX = e.clientX;
-      this.lastPanY = e.clientY;
-      this.updateBackgroundTransform();
-    }
+  movePan(clientX, clientY) {
+    if (!this.isPanning || !this.canTransform()) return;
+    const delta = this.getCanvasDelta(clientX - this.lastPointerX, clientY - this.lastPointerY);
+    this.imageOffsetX += delta.x;
+    this.imageOffsetY += delta.y;
+    this.lastPointerX = clientX;
+    this.lastPointerY = clientY;
+    this.queueInteractiveRedraw();
   }
 
-  handleBackgroundPanEnd() {
+  endPan(commitHistory = true) {
+    if (!this.isPanning) return;
     this.isPanning = false;
-    this.lastTouchDistance = 0; // Reset touch distance
-    this.canvas.style.cursor = 'grab';
+    this.lastTouchDistance = 0;
+    this.canvas.classList.remove('grabbing');
+    if (commitHistory && this.originalImage) this.redraw(true);
   }
 
-  updateBackgroundTransform() {
-    this.canvas.style.backgroundSize = `${100 * this.backgroundZoom}%`;
-    this.canvas.style.backgroundPosition = `${this.backgroundPanX}px ${this.backgroundPanY}px`;
+  handleMouseDown(event) {
+    if (event.button !== 0 || !this.beginPan(event.clientX, event.clientY)) return;
+    event.preventDefault();
+  }
+
+  handleMouseMove(event) {
+    this.movePan(event.clientX, event.clientY);
+  }
+
+  handleMouseUp() {
+    this.endPan(true);
+  }
+
+  handleWheel(event) {
+    if (!this.canTransform()) return;
+    event.preventDefault();
+    if (this.zoomImage(event.deltaY > 0 ? 0.97 : 1.03, false)) {
+      this.scheduleTransformCommit();
+    }
   }
 
   getTouchDistance(touches) {
-    const touch1 = touches[0];
-    const touch2 = touches[1];
-    return Math.sqrt(
-      Math.pow(touch2.clientX - touch1.clientX, 2) +
-      Math.pow(touch2.clientY - touch1.clientY, 2)
-    );
+    const deltaX = touches[0].clientX - touches[1].clientX;
+    const deltaY = touches[0].clientY - touches[1].clientY;
+    return Math.sqrt(deltaX * deltaX + deltaY * deltaY);
+  }
+
+  handleTouchStart(event) {
+    if (!this.canTransform()) return;
+    event.preventDefault();
+    if (event.touches.length === 1) {
+      this.beginPan(event.touches[0].clientX, event.touches[0].clientY);
+    } else if (event.touches.length === 2) {
+      this.endPan(false);
+      this.lastTouchDistance = this.getTouchDistance(event.touches);
+    }
+  }
+
+  handleTouchMove(event) {
+    if (!this.canTransform()) return;
+    event.preventDefault();
+    if (event.touches.length === 1 && this.isPanning) {
+      this.movePan(event.touches[0].clientX, event.touches[0].clientY);
+    } else if (event.touches.length === 2) {
+      const nextDistance = this.getTouchDistance(event.touches);
+      if (this.lastTouchDistance > 0) {
+        this.zoomImage(nextDistance / this.lastTouchDistance, false);
+      }
+      this.lastTouchDistance = nextDistance;
+    }
+  }
+
+  handleTouchEnd(event) {
+    if (!this.originalImage) return;
+    if (event.touches.length === 1) {
+      this.lastTouchDistance = 0;
+      this.beginPan(event.touches[0].clientX, event.touches[0].clientY);
+      return;
+    }
+    const wasPinching = this.lastTouchDistance > 0;
+    this.endPan(true);
+    if (wasPinching) {
+      this.lastTouchDistance = 0;
+      this.redraw(true);
+    }
   }
 
   initCropTools() {
-    document.getElementById('crop-zoom-in').addEventListener('click', (e) => {
-      e.preventDefault();
-      this.handleBackgroundZoom({ preventDefault: () => { }, deltaY: -1 });
-    });
+    this.canvas.addEventListener('mousedown', this.handleMouseDown);
+    window.addEventListener('mousemove', this.handleMouseMove);
+    window.addEventListener('mouseup', this.handleMouseUp);
+    this.canvas.addEventListener('wheel', this.handleWheel, { passive: false });
+    this.canvas.addEventListener('touchstart', this.handleTouchStart, { passive: false });
+    this.canvas.addEventListener('touchmove', this.handleTouchMove, { passive: false });
+    this.canvas.addEventListener('touchend', this.handleTouchEnd, { passive: false });
+    this.canvas.addEventListener('touchcancel', this.handleTouchEnd, { passive: false });
 
-    document.getElementById('crop-zoom-out').addEventListener('click', (e) => {
-      e.preventDefault();
-      this.handleBackgroundZoom({ preventDefault: () => { }, deltaY: 1 });
-    });
-
-    document.getElementById('crop-move-left').addEventListener('click', (e) => {
-      e.preventDefault();
-      this.backgroundPanX -= 10;
-      this.updateBackgroundTransform();
-    });
-
-    document.getElementById('crop-move-right').addEventListener('click', (e) => {
-      e.preventDefault();
-      this.backgroundPanX += 10;
-      this.updateBackgroundTransform();
-    });
-
-    document.getElementById('crop-move-up').addEventListener('click', (e) => {
-      e.preventDefault();
-      this.backgroundPanY -= 10;
-      this.updateBackgroundTransform();
-    });
-
-    document.getElementById('crop-move-down').addEventListener('click', (e) => {
-      e.preventDefault();
-      this.backgroundPanY += 10;
-      this.updateBackgroundTransform();
-    });
+    const rotateLeft = document.getElementById('rotate-left');
+    const rotateRight = document.getElementById('rotate-right');
+    const zoomOut = document.getElementById('zoom-out-image');
+    const zoomIn = document.getElementById('zoom-in-image');
+    const resetTransform = document.getElementById('reset-transform');
+    if (rotateLeft) rotateLeft.addEventListener('click', () => this.rotateImage(-90));
+    if (rotateRight) rotateRight.addEventListener('click', () => this.rotateImage(90));
+    if (zoomOut) zoomOut.addEventListener('click', () => this.zoomImage(0.98, true));
+    if (zoomIn) zoomIn.addEventListener('click', () => this.zoomImage(1.02, true));
+    if (resetTransform) resetTransform.addEventListener('click', () => this.resetTransform(true));
+    this.setControlsEnabled(false);
   }
 }
