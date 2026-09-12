@@ -3,6 +3,7 @@ let epdService, epdCharacteristic;
 let otaService, otaTxCharacteristic, otaRxCharacteristic, otaControlCharacteristic;
 let otaReceiveBuffer = new Uint8Array(0);
 let otaPendingResponse = null;
+let otaPendingSignal = null;
 let otaSelectedPackage = null;
 let otaBusy = false;
 let otaFinalizing = false;
@@ -23,6 +24,7 @@ let ditherSourceImageData = null;
 let paintManager, cropManager;
 let rleSupport;
 let ledEnabled = false;
+let batteryWarningLevel = 0;
 let ledWriteChain = Promise.resolve();
 let slotStreamSupport = false;
 let slotActionPending = false;
@@ -31,6 +33,9 @@ let slotReadState = null;
 let slotReadTimer = null;
 let slotState = { count: 0, pageStart: 0, pageCount: 0, usedMask: 0, selected: null, flashSize: 0, fingerprints: [] };
 const slotPreviewCache = new Map();
+let timeSampleWaiter = null;
+let timeMeasurementBusy = false;
+let lastDeviceTimeSample = null;
 
 function createSerialQueue() {
   let tail = Promise.resolve();
@@ -44,6 +49,7 @@ function createSerialQueue() {
 function shouldSyncAfterActivation(message, pending) {
   return pending && message.startsWith('activation=1');
 }
+
 
 let enqueueGattWrite = createSerialQueue();
 
@@ -63,6 +69,8 @@ const OTA_TAIL_SIZE = 48;
 // MTU 244 leaves 241 ATT bytes. The DFU frame and PROGRAM_FLASH payload use
 // 15 bytes, so 226 bytes is the largest firmware chunk that fits one write.
 const OTA_CHUNK_SIZE = 226;
+// Fast DFU sends raw ATT payloads after erase; MTU 244 leaves 241 bytes.
+const OTA_FAST_CHUNK_SIZE = 241;
 const OTA_MAX_RESPONSE_PAYLOAD = 512;
 const OTA_ACTIVATION_MARKERS = ['locked=activation_required', 'activation=already'];
 
@@ -91,7 +99,8 @@ const EpdCmd = {
   SET_LED: 0x23,
   GET_ACTIVATION: 0x24,
   ACTIVATE: 0x25,
-  GET_STATUS: 0x29,
+  GET_STATUS: 0x2B,
+  GET_TIME: 0x2A,
 
   WRITE_IMG: 0x30, // v1.6
   SET_SLOT: 0x31,
@@ -115,7 +124,7 @@ function updateBatteryStatus(voltage, battery, temperature) {
   const el = document.getElementById('batteryStatus');
   if (!el) return;
   const mv = Number(voltage);
-  const pct = Math.max(0, Math.min(100, Number(battery)));
+  const pct = Math.max(1, Math.min(100, Number(battery)));
   if (!Number.isFinite(mv) || !Number.isFinite(pct)) {
     el.textContent = '电量 --';
     el.title = '设备电池电量暂不可用';
@@ -123,8 +132,16 @@ function updateBatteryStatus(voltage, battery, temperature) {
   }
   const volts = (mv / 1000).toFixed(2);
   el.textContent = `电量 ${pct}% · ${volts}V`;
-  el.title = `电池 ${volts}V（${mv} mV）${Number.isFinite(Number(temperature)) ? `，温度 ${temperature}℃` : ''}`;
+  const tempText = Number(temperature) === -1 ? '温度不可用' : (Number.isFinite(Number(temperature)) ? `温度 ${temperature}℃` : '');
+  el.title = `电池 ${volts}V（${mv} mV）${tempText ? `，${tempText}` : ''}`;
   el.classList.toggle('battery-low', pct <= 20);
+  const warningLevel = mv <= 2700 || pct <= 5 ? 2 : (mv <= 2850 || pct <= 15 ? 1 : 0);
+  el.classList.toggle('battery-critical', warningLevel === 2);
+  if (warningLevel !== batteryWarningLevel) {
+    if (warningLevel === 2) addLog(`严重低电量提醒：${pct}%（${volts}V），已接近墨水屏最低刷新电压 2.70V`);
+    else if (warningLevel === 1) addLog(`低电量提醒：${pct}%（${volts}V），请及时充电`);
+    batteryWarningLevel = warningLevel;
+  }
 }
 
 async function refreshBatteryStatus() {
@@ -290,6 +307,11 @@ function resetVariables() {
     otaPendingResponse.reject(error);
     otaPendingResponse = null;
   }
+  if (otaPendingSignal) {
+    clearTimeout(otaPendingSignal.timer);
+    otaPendingSignal.reject(new Error('蓝牙连接已断开'));
+    otaPendingSignal = null;
+  }
   gattServer = null;
   epdService = null;
   epdCharacteristic = null;
@@ -421,6 +443,101 @@ async function syncTime(mode) {
     addLog("时间已同步！");
     addLog("屏幕刷新完成前请不要操作。");
   }
+}
+
+function localUnixSeconds() {
+  return (Date.now() / 1000) + (new Date().getTimezoneOffset() * 60);
+}
+
+function resolveTimeSample(rawSeconds) {
+  const normalized = Number(rawSeconds) + (new Date().getTimezoneOffset() * 60);
+  lastDeviceTimeSample = { raw: Number(rawSeconds), unix: normalized, receivedAt: performance.now() };
+  if (timeSampleWaiter) {
+    const waiter = timeSampleWaiter;
+    timeSampleWaiter = null;
+    waiter.resolve(lastDeviceTimeSample);
+  }
+}
+
+function waitForTimeSample(timeoutMs = 2500) {
+  if (timeSampleWaiter) return Promise.resolve(null);
+  return new Promise(resolve => {
+    const waiter = { resolve: value => { clearTimeout(timer); resolve(value); } };
+    const timer = setTimeout(() => {
+      if (timeSampleWaiter !== waiter) return;
+      timeSampleWaiter = null;
+      resolve(null);
+    }, timeoutMs);
+    timeSampleWaiter = waiter;
+  });
+}
+
+async function requestTimeSample() {
+  if (!epdCharacteristic || !gattServer?.connected || bootloaderMode) return null;
+  const wait = waitForTimeSample();
+  const sentAt = performance.now();
+  if (!await write(EpdCmd.GET_TIME, new Uint8Array(0), false)) {
+    timeSampleWaiter = null;
+    return null;
+  }
+  const sample = await wait;
+  if (!sample) return null;
+  const receivedAt = sample.receivedAt;
+  // The device value is normalized to UTC above; Date.now() is already UTC.
+  // Do not apply the browser timezone offset a second time to the midpoint.
+  const midpoint = (Date.now() / 1000) + (receivedAt - sentAt) / 2000;
+  // The firmware exposes whole seconds. Treat the reported second as the
+  // center of its one-second interval so truncation is not reported as drift.
+  return { ...sample, errorMs: (sample.unix + 0.5 - midpoint) * 1000, rttMs: receivedAt - sentAt };
+}
+
+async function measureDeviceClock() {
+  if (timeMeasurementBusy) return;
+  timeMeasurementBusy = true;
+  const status = document.getElementById('timeCalibrationStatus');
+  if (status) status.textContent = '正在采样设备时钟...';
+  const samples = [];
+  try {
+    for (let i = 0; i < 8; i++) {
+      const sample = await requestTimeSample();
+      if (sample) samples.push(sample);
+      if (i < 7) await new Promise(resolve => setTimeout(resolve, 180));
+    }
+    if (!samples.length) throw new Error('设备未返回时间，请确认固件支持时间读取');
+    const errors = samples.map(s => s.errorMs);
+    const average = errors.reduce((a, b) => a + b, 0) / errors.length;
+    const min = Math.min(...errors), max = Math.max(...errors);
+    const text = `误差 ${average >= 0 ? '+' : ''}${average.toFixed(0)} ms · 范围 ${min.toFixed(0)}~${max.toFixed(0)} ms · ${samples.length} 次`;
+    if (status) status.textContent = text;
+    addLog(`时钟测量：${text}，平均往返 ${(samples.reduce((a, s) => a + s.rttMs, 0) / samples.length).toFixed(0)} ms`);
+  } catch (error) {
+    if (status) status.textContent = `测量失败：${error.message}`;
+    addLog(`时钟测量失败：${error.message}`);
+  } finally { timeMeasurementBusy = false; }
+}
+
+async function calibrateDeviceTime() {
+  if (!epdCharacteristic || !gattServer?.connected || bootloaderMode) {
+    addLog('请先连接应用固件设备后再校准时间');
+    return;
+  }
+  const status = document.getElementById('timeCalibrationStatus');
+  if (status) status.textContent = '正在校准设备时间...';
+  const before = await requestTimeSample();
+  const target = Math.floor(Date.now() / 1000);
+  const data = new Uint8Array([(target >> 24) & 0xFF, (target >> 16) & 0xFF, (target >> 8) & 0xFF, target & 0xFF, -(new Date().getTimezoneOffset() / 60), 1]);
+  const started = performance.now();
+  if (!await write(EpdCmd.SET_TIME, data, true)) {
+    if (status) status.textContent = '校准失败：写入未确认';
+    return;
+  }
+  await new Promise(resolve => setTimeout(resolve, 250));
+  const after = await requestTimeSample();
+  if (!after) { if (status) status.textContent = '已发送校准，等待设备返回超时'; return; }
+  const beforeText = before ? `${before.errorMs >= 0 ? '+' : ''}${before.errorMs.toFixed(0)} ms` : '未读取';
+  const afterText = `${after.errorMs >= 0 ? '+' : ''}${after.errorMs.toFixed(0)} ms`;
+  if (status) status.textContent = `已校准 · 校准前 ${beforeText} · 当前 ${afterText}`;
+  addLog(`时间校准完成：校准前 ${beforeText}，当前 ${afterText}，耗时 ${((performance.now() - started) / 1000).toFixed(2)} s`);
 }
 
 async function setCalendarTheme(theme) {
@@ -1174,7 +1291,10 @@ function handleNotify(value, idx) {
   } else {
     if (textDecoder == null) textDecoder = new TextDecoder();
     const msg = textDecoder.decode(data);
-    addLog(msg, '⇓');
+    const logMessage = msg.startsWith('activation=')
+      ? (msg.startsWith('activation=1') ? '设备已激活' : '设备未激活')
+      : msg;
+    addLog(logMessage, '⇓');
     if (msg === 'slot_v2=1 slot_stream=1') {
       slotStreamSupport = true;
       void refreshSlots(0);
@@ -1240,7 +1360,7 @@ function handleNotify(value, idx) {
       const match = /^status voltage=(\d+) battery=(\d{1,3}) temperature=(-?\d+)$/.exec(msg);
       if (match) {
         updateBatteryStatus(Number(match[1]), Number(match[2]), Number(match[3]));
-        addLog(`电池电量: ${match[2]}%（${(Number(match[1]) / 1000).toFixed(2)}V）`);
+        addLog(`电池电量: ${match[2]}%（${(Number(match[1]) / 1000).toFixed(2)}V）${Number(match[3]) === -1 ? '，温度不可用' : `，温度 ${match[3]}℃`}`);
       }
     } else if (msg === 'activation=already') {
       recordActivationState(true);
@@ -1278,7 +1398,9 @@ function handleNotify(value, idx) {
       setActivationPanelVisible(true);
       document.getElementById('activationStatus').textContent = '设备未激活，当前功能已被固件拒绝';
     } else if (msg.startsWith('t=') && msg.length > 2) {
-      const t = parseInt(msg.substring(2)) + new Date().getTimezoneOffset() * 60;
+      const rawSeconds = parseInt(msg.substring(2));
+      resolveTimeSample(rawSeconds);
+      const t = rawSeconds + new Date().getTimezoneOffset() * 60;
       addLog(`远端时间: ${new Date(t * 1000).toLocaleString()}`);
       addLog(`本地时间: ${new Date().toLocaleString()}`);
     }
@@ -1560,18 +1682,40 @@ function handleOtaNotification(event) {
     }
 
     const data = frame.slice(6, frame.length - 2);
-    if (otaPendingResponse && otaPendingResponse.command === command) {
+    if (otaPendingResponse && otaPendingResponse.command === command &&
+        (!otaPendingResponse.accept || otaPendingResponse.accept(data))) {
       const pending = otaPendingResponse;
       otaPendingResponse = null;
       clearTimeout(pending.timer);
       pending.resolve(data);
+    } else if (otaPendingSignal && otaPendingSignal.command === command && otaPendingSignal.accept(data)) {
+      const signal = otaPendingSignal;
+      otaPendingSignal = null;
+      clearTimeout(signal.timer);
+      signal.resolve(data);
     } else {
       addLog(`OTA 收到未等待的响应: 0x${command.toString(16)}`);
     }
   }
 }
 
-async function sendDfuRequest(command, payload = new Uint8Array(0), timeoutMs = 10000) {
+function waitForDfuSignal(command, accept, timeoutMs = 30000) {
+  if (otaPendingSignal) throw new Error('上一条 OTA 状态通知尚未完成');
+  let resolveSignal;
+  let rejectSignal;
+  const response = new Promise((resolve, reject) => {
+    resolveSignal = resolve;
+    rejectSignal = reject;
+  });
+  const timer = setTimeout(() => {
+    if (otaPendingSignal && otaPendingSignal.command === command) otaPendingSignal = null;
+    rejectSignal(new Error(`OTA 状态 0x${command.toString(16)} 等待超时`));
+  }, timeoutMs);
+  otaPendingSignal = { command, accept, resolve: resolveSignal, reject: rejectSignal, timer };
+  return response;
+}
+
+async function sendDfuRequest(command, payload = new Uint8Array(0), timeoutMs = 10000, accept = null) {
   if (!otaRxCharacteristic) throw new Error('OTA 写入通道不可用');
   if (otaPendingResponse) throw new Error('上一条 OTA 命令尚未完成');
 
@@ -1585,7 +1729,7 @@ async function sendDfuRequest(command, payload = new Uint8Array(0), timeoutMs = 
     if (otaPendingResponse && otaPendingResponse.command === command) otaPendingResponse = null;
     rejectResponse(new Error(`OTA 命令 0x${command.toString(16)} 响应超时`));
   }, timeoutMs);
-  otaPendingResponse = { command, resolve: resolveResponse, reject: rejectResponse, timer };
+  otaPendingResponse = { command, resolve: resolveResponse, reject: rejectResponse, timer, accept };
 
   try {
     await otaRxCharacteristic.writeValueWithoutResponse(makeDfuFrame(command, payload));
@@ -1597,8 +1741,8 @@ async function sendDfuRequest(command, payload = new Uint8Array(0), timeoutMs = 
   return response;
 }
 
-async function expectDfuSuccess(command, payload = new Uint8Array(0), timeoutMs = 10000) {
-  const response = await sendDfuRequest(command, payload, timeoutMs);
+async function expectDfuSuccess(command, payload = new Uint8Array(0), timeoutMs = 10000, accept = null) {
+  const response = await sendDfuRequest(command, payload, timeoutMs, accept);
   if (response.length === 0 || response[0] !== 1) {
     throw new Error(`OTA 命令 0x${command.toString(16)} 执行失败`);
   }
@@ -1607,6 +1751,32 @@ async function expectDfuSuccess(command, payload = new Uint8Array(0), timeoutMs 
 
 function delay(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+async function sendFastOtaPayload(firmware) {
+  const mtu = Number(document.getElementById('mtusize')?.value) || 244;
+  const chunkSize = Math.min(OTA_FAST_CHUNK_SIZE, Math.max(1, mtu - 3));
+  // Fast DFU acknowledges only after its internal 1 KiB buffer is flushed.
+  // Keep the completion waiter armed while the browser streams raw ATT writes.
+  const completed = waitForDfuSignal(0xFF, data => data.length >= 1 && data[0] === 1, 60000);
+  try {
+    for (let offset = 0; offset < firmware.length; offset += chunkSize) {
+      const chunk = firmware.subarray(offset, Math.min(offset + chunkSize, firmware.length));
+      await otaRxCharacteristic.writeValueWithoutResponse(chunk);
+      const written = offset + chunk.length;
+      const progress = 7 + (written / firmware.length) * 90;
+      setOtaProgress(progress);
+      updateOtaMetrics(written);
+      setOtaStatus(`正在快速写入固件 ${(written / 1024).toFixed(1)} / ${(firmware.length / 1024).toFixed(1)} KiB`);
+    }
+    await completed;
+  } catch (error) {
+    if (otaPendingSignal) {
+      clearTimeout(otaPendingSignal.timer);
+      otaPendingSignal = null;
+    }
+    throw error;
+  }
 }
 
 async function startOtaUpgrade() {
@@ -1664,34 +1834,33 @@ async function startOtaUpgrade() {
     await delay(150);
 
     const startPayload = new Uint8Array(1 + OTA_IMAGE_INFO_SIZE);
-    startPayload[0] = 0;
+    // SDK DFU fast-inner mode (0x02) avoids a response round-trip per chunk.
+    startPayload[0] = 0x02;
     startPayload.set(otaSelectedPackage.imageInfo, 1);
     // In copy mode Goodix expects load_addr to point at the staging bank while
     // run_addr remains the final application address. Bootloader rescue writes
     // directly to the original application address in non-copy mode.
     writeUint32LE(startPayload, 1 + 12, targetAddress);
     setOtaStatus(bootloaderMode ? '正在恢复应用固件' : '正在擦除 OTA 暂存区');
-    await expectDfuSuccess(DfuCmd.PROGRAM_START, startPayload, 60000);
+    const eraseComplete = waitForDfuSignal(
+      DfuCmd.PROGRAM_START,
+      data => data.length >= 2 && data[0] === 1 && data[1] === 3,
+      60000,
+    );
+    await expectDfuSuccess(
+      DfuCmd.PROGRAM_START,
+      startPayload,
+      60000,
+      data => data.length >= 1 && (data[0] !== 1 || data[1] === 1),
+    );
+    await eraseComplete;
+    addLog('OTA 快速模式擦除完成，开始连续传输');
     setOtaProgress(7);
     otaTransferStats.transferStartedAt = performance.now();
     updateOtaMetrics(0);
 
     const firmware = otaSelectedPackage.bytes;
-    for (let offset = 0; offset < firmware.length; offset += OTA_CHUNK_SIZE) {
-      const chunk = firmware.subarray(offset, Math.min(offset + OTA_CHUNK_SIZE, firmware.length));
-      const payload = new Uint8Array(7 + chunk.length);
-      payload[0] = 1;
-      writeUint32LE(payload, 1, targetAddress + offset);
-      new DataView(payload.buffer).setUint16(5, chunk.length, true);
-      payload.set(chunk, 7);
-      await expectDfuSuccess(DfuCmd.PROGRAM_FLASH, payload, 15000);
-
-      const written = offset + chunk.length;
-      const progress = 7 + (written / firmware.length) * 90;
-      setOtaProgress(progress);
-      updateOtaMetrics(written);
-      setOtaStatus(`正在写入固件 ${(written / 1024).toFixed(1)} / ${(firmware.length / 1024).toFixed(1)} KiB`);
-    }
+    await sendFastOtaPayload(firmware);
 
     const endPayload = new Uint8Array(5);
     endPayload[0] = 1;
@@ -1718,6 +1887,10 @@ async function startOtaUpgrade() {
       setOtaStatus('OTA 传输已完成，设备正在重启；请重连确认版本', 'success');
       addLog('PROGRAM_END 已提交，断开属于设备重启阶段');
     } else {
+      if (otaPendingSignal) {
+        clearTimeout(otaPendingSignal.timer);
+        otaPendingSignal = null;
+      }
       otaFinalizing = false;
       setOtaStatus(`OTA 升级失败: ${e.message || e}`, 'error');
       addLog(`OTA 升级失败: ${e.message || e}`);

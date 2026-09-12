@@ -971,6 +971,7 @@ legend .battery-status { margin-left: 10px; vertical-align: middle; }
   color: #ffe0e0;
   background: rgba(164, 47, 47, .48);
 }
+.battery-status.battery-critical { color: #fff; border-color: #b42318; background: #b42318; }
 .app-top-nav .app-brand {
     display:inline-flex;
     align-items:center;
@@ -1854,4 +1855,17 @@ body.custom-background .log-container { background: rgba(24,33,44,.94); }
         min-width: 0;
         margin: 0;
     }
+}
+/* Clock diagnostics stay compact on both desktop and mobile layouts. */
+.time-calibration-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2rem;
+  color: var(--muted-text, #667085);
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .time-calibration-status { flex-basis: 100%; white-space: normal; }
 }

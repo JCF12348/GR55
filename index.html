@@ -133,9 +133,12 @@
 						<span id="ledBrightnessValue">100%</span>
 					</div>
 					<button id="otaToggleButton" type="button" class="secondary" aria-expanded="false" aria-controls="otaPanel" onclick="toggleOtaPanel()">OTA 升级</button>
+					<button id="measureClockButton" type="button" class="secondary" onclick="measureDeviceClock()" title="连续读取设备时间并与电脑时钟比较">测量时钟误差</button>
+					<button id="calibrateClockButton" type="button" class="primary" onclick="calibrateDeviceTime()" title="将设备时间校准为当前电脑时间">校准设备时间</button>
+					<span id="timeCalibrationStatus" class="time-calibration-status" role="status" aria-live="polite">未测量</span>
 				</div>
 				<div class="flex-group command-group debug">
-					<input type="text" id="cmdTXT" value="" placeholder="输入原始命令或 418 位激活码" title="命令提示：&#10;20：同步时间&#10;21 + 00-06：设置每周起始日（周日=00）&#10;22 + 00-05：切换日历主题&#10;23：控制 LED（板型/开关/颜色/亮度）&#10;24：读取激活状态；25：发送激活码&#10;29：读取电压、电量和温度&#10;30-35：图片传输、槽位、删除、轮播、读取、查询&#10;91：设备复位；92：进入休眠&#10;输入 418 位激活码会自动按激活协议发送">
+					<input type="text" id="cmdTXT" value="" placeholder="输入原始命令或 418 位激活码" title="命令提示：&#10;20：同步时间&#10;2A：读取设备时间（用于误差测量）&#10;2B：读取电压、电量和温度&#10;21 + 00-06：设置每周起始日（周日=00）&#10;22 + 00-05：切换日历主题&#10;23：控制 LED（板型/开关/颜色/亮度）&#10;24：读取激活状态；25：发送激活码&#10;29：取消激活请求&#10;30-35：图片传输、槽位、删除、轮播、读取、查询&#10;91：设备复位；92：进入休眠&#10;输入 418 位激活码会自动按激活协议发送">
 					<button id="sendcmdbutton" type="button" class="primary" onclick="sendcmd()">发送命令</button>
 				</div>
 			</div>
