@@ -5,12 +5,21 @@ let otaReceiveBuffer = new Uint8Array(0);
 let otaPendingResponse = null;
 let otaSelectedPackage = null;
 let otaBusy = false;
+let otaFinalizing = false;
+let otaCompletedAwaitingRestart = false;
+let otaTransferStats = null;
+let otaExpectedActivationState = null;
+let otaVerificationPending = false;
+let deviceActivationState = null;
+let activationStateWaiters = [];
 let bootloaderMode = false;
 let activationSubmitPending = false;
 let activationResetExpected = false;
 let activationReconnectSyncPending = false;
 let startTime, msgIndex, appVersion;
 let canvas, ctx, textDecoder;
+let ditherPreviewFrame = 0;
+let ditherSourceImageData = null;
 let paintManager, cropManager;
 let rleSupport;
 let ledEnabled = false;
@@ -51,7 +60,11 @@ const OTA_SAVE_ADDRESS = 0x01050000;
 const OTA_NVDS_ADDRESS = 0x0107F000;
 const OTA_IMAGE_INFO_SIZE = 40;
 const OTA_TAIL_SIZE = 48;
-const OTA_CHUNK_SIZE = 200;
+// MTU 244 leaves 241 ATT bytes. The DFU frame and PROGRAM_FLASH payload use
+// 15 bytes, so 226 bytes is the largest firmware chunk that fits one write.
+const OTA_CHUNK_SIZE = 226;
+const OTA_MAX_RESPONSE_PAYLOAD = 512;
+const OTA_ACTIVATION_MARKERS = ['locked=activation_required', 'activation=already'];
 
 const DfuCmd = {
   GET_INFO: 0x01,
@@ -267,9 +280,14 @@ function intToHex(intIn) {
 }
 
 function resetVariables() {
+  for (const resolve of activationStateWaiters) resolve(null);
+  activationStateWaiters = [];
+  deviceActivationState = null;
   if (otaPendingResponse) {
     clearTimeout(otaPendingResponse.timer);
-    otaPendingResponse.reject(new Error('蓝牙连接已断开'));
+    const error = new Error('蓝牙连接已断开');
+    error.otaRestartExpected = otaFinalizing;
+    otaPendingResponse.reject(error);
     otaPendingResponse = null;
   }
   gattServer = null;
@@ -281,6 +299,8 @@ function resetVariables() {
   otaControlCharacteristic = null;
   otaReceiveBuffer = new Uint8Array(0);
   otaBusy = false;
+  otaFinalizing = false;
+  otaCompletedAwaitingRestart = false;
   bootloaderMode = false;
   msgIndex = 0;
   rleSupport = false;
@@ -295,6 +315,7 @@ function resetVariables() {
   slotReadTimer = null;
   slotReadState = null;
   slotState = { count: 0, pageStart: 0, pageCount: 0, usedMask: 0, selected: null, flashSize: 0, fingerprints: [] };
+  renderSlotGrid();
   updateBatteryStatus(NaN, NaN, NaN);
   enqueueGattWrite = createSerialQueue();
   setActivationPanelVisible(false);
@@ -528,7 +549,7 @@ function renderSlotGrid() {
     empty.textContent = '设备未识别到可用外置 Flash';
     grid.appendChild(empty);
     summary.textContent = '无可用图片槽';
-    hint.textContent = '请检查 P25Q40L 接线和供电';
+    hint.textContent = '未检测到外置存储';
     pagination.hidden = true;
     return;
   }
@@ -755,8 +776,10 @@ function finishSlotRead(success, message = '') {
 }
 
 async function sendcmd() {
-  const cmdTXT = document.getElementById('cmdTXT').value.trim();
+  const input = document.getElementById('cmdTXT');
+  const cmdTXT = input.value.trim();
   if (cmdTXT === '') return;
+  input.value = '';
   if (!/^[0-9a-f\s-]+$/i.test(cmdTXT)) {
     addLog('命令或激活码只能包含十六进制字符');
     return;
@@ -945,7 +968,7 @@ function updateButtonStatus(forceDisabled = false) {
   const connected = gattServer != null && gattServer.connected;
   const epdReady = connected && epdCharacteristic && !forceDisabled && !otaBusy;
   document.getElementById("connectbutton").disabled = otaBusy;
-  document.getElementById("reconnectbutton").disabled = otaBusy || gattServer == null || gattServer.connected;
+  document.getElementById("reconnectbutton").disabled = otaBusy || bleDevice == null || connected;
   document.getElementById("sendcmdbutton").disabled = !epdReady;
   document.getElementById("calendarmodebutton").disabled = !epdReady;
   document.getElementById("clockmodebutton").disabled = !epdReady;
@@ -984,13 +1007,20 @@ function toggleOtaPanel() {
 
 function disconnect() {
   const wasBootloader = bootloaderMode;
+  const otaRestartExpected = otaFinalizing || otaCompletedAwaitingRestart;
   const activationRestart = activationSubmitPending || activationResetExpected;
   activationSubmitPending = false;
   activationResetExpected = false;
   resetVariables();
   updateButtonStatus();
   addLog('已断开连接.');
-  if (otaSelectedPackage) {
+  if (otaRestartExpected) {
+    otaVerificationPending = true;
+    setOtaProgress(100);
+    setOtaStatus('OTA 传输已完成，设备正在重启并校验激活状态', 'success');
+    addLog('OTA 结束阶段设备已断开，按正常重启处理');
+    setTimeout(() => confirmOtaAfterReset(1), 1800);
+  } else if (otaSelectedPackage) {
     setOtaStatus('设备已断开，请重新扫描 GR_EPD 或 Bootloader_OTA 后继续升级');
     if (wasBootloader) addLog('Bootloader OTA 已断开，请重新扫描 Bootloader_OTA 继续救援');
   } else {
@@ -1002,6 +1032,63 @@ function disconnect() {
     document.getElementById('activationStatus').textContent = '设备已执行激活并重启，请重新连接确认状态';
     addLog('激活后设备正常复位，断开属于预期行为');
     setTimeout(() => confirmActivationAfterReset(1), 1800);
+  }
+}
+
+async function waitForActivationState(timeoutMs = 3500) {
+  if (!epdCharacteristic || !gattServer || !gattServer.connected) return null;
+  deviceActivationState = null;
+  let waiter;
+  const response = new Promise(resolve => {
+    waiter = resolve;
+    activationStateWaiters.push(resolve);
+  });
+  if (!await write(EpdCmd.GET_ACTIVATION)) {
+    activationStateWaiters = activationStateWaiters.filter(resolve => resolve !== waiter);
+    return null;
+  }
+  const result = await Promise.race([
+    response,
+    new Promise(resolve => setTimeout(() => resolve(null), timeoutMs)),
+  ]);
+  activationStateWaiters = activationStateWaiters.filter(resolve => resolve !== waiter);
+  return result;
+}
+
+function recordActivationState(active) {
+  deviceActivationState = active;
+  const waiters = activationStateWaiters;
+  activationStateWaiters = [];
+  for (const resolve of waiters) resolve(active);
+}
+
+async function confirmOtaAfterReset(attempt) {
+  if (!otaVerificationPending || !bleDevice) return;
+  if (!gattServer || !gattServer.connected) {
+    addLog(`正在自动重连确认 OTA 结果（${attempt}/3）`);
+    await connect();
+  }
+  if (gattServer && gattServer.connected && epdCharacteristic) {
+    const current = await waitForActivationState();
+    if (current !== null) {
+      otaVerificationPending = false;
+      if (otaExpectedActivationState === null || current === otaExpectedActivationState) {
+        const stateText = current ? '已激活' : '未激活';
+        setOtaStatus(`OTA 升级完成，设备${stateText}状态已保留`, 'success');
+        addLog(`OTA 后校验通过：设备仍为${stateText}`);
+      } else {
+        setOtaStatus('OTA 后激活状态与升级前不一致，请停止操作并检查 NVDS', 'error');
+        addLog('OTA 激活保护告警：升级前后激活状态不一致');
+      }
+      return;
+    }
+  }
+  if (attempt < 3) {
+    setTimeout(() => confirmOtaAfterReset(attempt + 1), 1500 * attempt);
+  } else {
+    otaVerificationPending = false;
+    setOtaStatus('OTA 传输已完成，但未能自动读取激活状态，请手动重连确认', 'error');
+    addLog('OTA 后自动校验超时，请手动重连');
   }
 }
 
@@ -1076,7 +1163,13 @@ function handleNotify(value, idx) {
     const epddriver = document.getElementById("epddriver");
     epdpins.value = bytes2hex(data.slice(0, 7));
     if (data.length > 10) epdpins.value += bytes2hex(data.slice(10, 11));
-    epddriver.value = bytes2hex(data.slice(7, 8));
+    const reportedDriver = bytes2hex(data.slice(7, 8));
+    if (epddriver.querySelector(`option[value="${reportedDriver}"]`)) {
+      epddriver.value = reportedDriver;
+      addLog(`设备驱动配置: ${reportedDriver === '13' ? '2.13寸 UC8151D 横屏' : reportedDriver}`);
+    } else {
+      addLog(`设备返回未知驱动配置: ${reportedDriver}`);
+    }
     updateDitcherOptions();
   } else {
     if (textDecoder == null) textDecoder = new TextDecoder();
@@ -1150,12 +1243,14 @@ function handleNotify(value, idx) {
         addLog(`电池电量: ${match[2]}%（${(Number(match[1]) / 1000).toFixed(2)}V）`);
       }
     } else if (msg === 'activation=already') {
+      recordActivationState(true);
       activationSubmitPending = false;
       activationResetExpected = false;
       setActivationPanelVisible(false);
       document.getElementById('activationStatus').textContent = '该设备已激活';
       addLog('该设备已激活，未重复写入激活信息');
     } else if (msg === 'activation=ok') {
+      recordActivationState(true);
       activationSubmitPending = false;
       activationResetExpected = true;
       setActivationPanelVisible(false);
@@ -1167,6 +1262,7 @@ function handleNotify(value, idx) {
       document.getElementById('activationStatus').textContent = '激活失败：证书无效或不属于本设备';
     } else if (msg.startsWith('activation=')) {
       const active = msg.startsWith('activation=1');
+      recordActivationState(active);
       const autoSync = shouldSyncAfterActivation(msg, activationReconnectSyncPending);
       activationSubmitPending = false;
       activationResetExpected = false;
@@ -1277,6 +1373,7 @@ async function connect() {
   if (!bootloaderMode) {
     await write(EpdCmd.INIT);
     await write(EpdCmd.GET_STATUS);
+    await queryActivation();
     setTimeout(() => {
       if (gattServer && gattServer.connected && epdCharacteristic && !otaBusy) void write(EpdCmd.GET_STATUS);
     }, 1200);
@@ -1306,10 +1403,45 @@ function setOtaProgress(value) {
   document.getElementById('otaProgressText').textContent = `${progress}%`;
 }
 
+function formatOtaDuration(milliseconds) {
+  const seconds = Math.max(0, milliseconds) / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)} 秒`;
+  return `${Math.floor(seconds / 60)} 分 ${Math.round(seconds % 60)} 秒`;
+}
+
+function updateOtaMetrics(written = 0, complete = false) {
+  const metrics = document.getElementById('otaMetrics');
+  if (!metrics || !otaTransferStats) return;
+  const now = performance.now();
+  const transferElapsed = Math.max(1, now - otaTransferStats.transferStartedAt);
+  const totalElapsed = Math.max(1, now - otaTransferStats.startedAt);
+  const speed = written > 0 ? written / 1024 / (transferElapsed / 1000) : 0;
+
+  if (complete) {
+    metrics.textContent = `平均 ${speed.toFixed(1)} KiB/s · 传输 ${formatOtaDuration(transferElapsed)} · 总耗时 ${formatOtaDuration(totalElapsed)}`;
+    return;
+  }
+
+  const remainingMs = speed > 0 ? ((otaTransferStats.totalBytes - written) / 1024 / speed) * 1000 : 0;
+  const remaining = speed > 0 ? ` · 预计剩余 ${formatOtaDuration(remainingMs)}` : '';
+  metrics.textContent = `${speed.toFixed(1)} KiB/s · ${(written / 1024).toFixed(1)} / ${(otaTransferStats.totalBytes / 1024).toFixed(1)} KiB · 已用 ${formatOtaDuration(totalElapsed)}${remaining}`;
+}
+
 function byteSum(data) {
   let sum = 0;
   for (const value of data) sum = (sum + value) >>> 0;
   return sum;
+}
+
+function containsAscii(data, marker) {
+  const expected = new TextEncoder().encode(marker);
+  outer: for (let i = 0; i <= data.length - expected.length; i++) {
+    for (let j = 0; j < expected.length; j++) {
+      if (data[i + j] !== expected[j]) continue outer;
+    }
+    return true;
+  }
+  return false;
 }
 
 function validateOtaPackage(bytes) {
@@ -1330,6 +1462,11 @@ function validateOtaPackage(bytes) {
     throw new Error('OTA 固件目标地址不是 0x01020000');
   }
   if (byteSum(bytes.subarray(0, binSize)) !== expectedChecksum) throw new Error('OTA 固件校验和错误');
+  for (const marker of OTA_ACTIVATION_MARKERS) {
+    if (!containsAscii(bytes.subarray(0, binSize), marker)) {
+      throw new Error('OTA 固件缺少激活保护标记，已拒绝旧版或非本项目固件');
+    }
+  }
   for (let i = bytes.length - 8; i < bytes.length; i++) {
     if (bytes[i] !== 0xFF) throw new Error('OTA 固件尾部格式错误');
   }
@@ -1405,6 +1542,11 @@ function handleOtaNotification(event) {
     const view = new DataView(otaReceiveBuffer.buffer, otaReceiveBuffer.byteOffset, otaReceiveBuffer.byteLength);
     const command = view.getUint16(2, true);
     const payloadLength = view.getUint16(4, true);
+    if (payloadLength > OTA_MAX_RESPONSE_PAYLOAD) {
+      addLog(`OTA 响应长度异常: ${payloadLength}，已重新同步`);
+      otaReceiveBuffer = otaReceiveBuffer.slice(2);
+      continue;
+    }
     const frameLength = payloadLength + 8;
     if (otaReceiveBuffer.length < frameLength) return;
 
@@ -1469,11 +1611,35 @@ function delay(milliseconds) {
 
 async function startOtaUpgrade() {
   if (!otaSelectedPackage || !otaRxCharacteristic || !otaControlCharacteristic) return;
-  if (!confirm('升级过程中请保持设备供电和蓝牙连接，确认开始 OTA 升级？')) return;
+  if (!bootloaderMode) {
+    setOtaStatus('正在读取升级前激活状态');
+    otaExpectedActivationState = await waitForActivationState();
+    if (otaExpectedActivationState === null) {
+      setOtaStatus('无法确认设备激活状态，已取消 OTA', 'error');
+      addLog('OTA 已取消：升级前未收到激活状态');
+      return;
+    }
+  } else {
+    // A generic Bootloader_OTA advertisement cannot be tied safely to the
+    // previously selected application device when several units are nearby.
+    otaExpectedActivationState = null;
+  }
+  const activationText = bootloaderMode ? '当前为 Bootloader 救援模式' :
+    `当前设备${otaExpectedActivationState ? '已激活' : '未激活'}，升级后将自动复核`;
+  if (!confirm(`${activationText}。\n升级过程中请保持设备供电和蓝牙连接，确认开始 OTA 升级？`)) return;
 
   otaBusy = true;
+  otaFinalizing = false;
+  otaCompletedAwaitingRestart = false;
+  otaVerificationPending = false;
+  otaTransferStats = {
+    startedAt: performance.now(),
+    transferStartedAt: performance.now(),
+    totalBytes: otaSelectedPackage.bytes.length,
+  };
   updateButtonStatus(true);
   setOtaProgress(1);
+  updateOtaMetrics(0);
   setOtaStatus('正在进入 OTA 模式');
   addLog('开始 Goodix BLE OTA 升级');
 
@@ -1507,6 +1673,8 @@ async function startOtaUpgrade() {
     setOtaStatus(bootloaderMode ? '正在恢复应用固件' : '正在擦除 OTA 暂存区');
     await expectDfuSuccess(DfuCmd.PROGRAM_START, startPayload, 60000);
     setOtaProgress(7);
+    otaTransferStats.transferStartedAt = performance.now();
+    updateOtaMetrics(0);
 
     const firmware = otaSelectedPackage.bytes;
     for (let offset = 0; offset < firmware.length; offset += OTA_CHUNK_SIZE) {
@@ -1521,6 +1689,7 @@ async function startOtaUpgrade() {
       const written = offset + chunk.length;
       const progress = 7 + (written / firmware.length) * 90;
       setOtaProgress(progress);
+      updateOtaMetrics(written);
       setOtaStatus(`正在写入固件 ${(written / 1024).toFixed(1)} / ${(firmware.length / 1024).toFixed(1)} KiB`);
     }
 
@@ -1528,20 +1697,33 @@ async function startOtaUpgrade() {
     endPayload[0] = 1;
     writeUint32LE(endPayload, 1, otaSelectedPackage.checksum);
     setOtaStatus('正在校验固件并重启设备');
+    otaFinalizing = true;
     const endResponse = await expectDfuSuccess(DfuCmd.PROGRAM_END, endPayload, 30000);
+    otaFinalizing = false;
     if (endResponse.length >= 5 && readUint32LE(endResponse, 1) !== otaSelectedPackage.checksum) {
       throw new Error('设备返回的整包校验和不匹配');
     }
 
+    otaCompletedAwaitingRestart = true;
     setOtaProgress(100);
+    updateOtaMetrics(firmware.length, true);
     setOtaStatus('OTA 升级完成，设备正在重启', 'success');
-    addLog('OTA 升级完成，设备正在重启');
+    addLog(`OTA 升级完成，${document.getElementById('otaMetrics')?.textContent || '设备正在重启'}`);
   } catch (e) {
     console.error(e);
-    setOtaStatus(`OTA 升级失败: ${e.message || e}`, 'error');
-    addLog(`OTA 升级失败: ${e.message || e}`);
-    if (!gattServer || !gattServer.connected) {
-      addLog('请点击连接并扫描 Bootloader_OTA，已选择的固件会保留，可直接继续恢复');
+    if (e.otaRestartExpected) {
+      otaCompletedAwaitingRestart = true;
+      setOtaProgress(100);
+      updateOtaMetrics(otaSelectedPackage.bytes.length, true);
+      setOtaStatus('OTA 传输已完成，设备正在重启；请重连确认版本', 'success');
+      addLog('PROGRAM_END 已提交，断开属于设备重启阶段');
+    } else {
+      otaFinalizing = false;
+      setOtaStatus(`OTA 升级失败: ${e.message || e}`, 'error');
+      addLog(`OTA 升级失败: ${e.message || e}`);
+      if (!gattServer || !gattServer.connected) {
+        addLog('请点击连接并扫描 Bootloader_OTA，已选择的固件会保留，可直接继续恢复');
+      }
     }
   } finally {
     otaBusy = false;
@@ -1578,7 +1760,7 @@ function addLog(logTXT, action = '') {
   log.appendChild(logEntry);
   log.scrollTop = log.scrollHeight;
 
-  while (log.childNodes.length > 20) {
+  while (log.childNodes.length > 120) {
     log.removeChild(log.firstChild);
   }
 }
@@ -1678,12 +1860,16 @@ function clearCanvas() {
   return false;
 }
 
-function convertDithering() {
+function convertDithering(saveHistory = true) {
   paintManager.redrawTextElements();
   paintManager.redrawLineSegments();
 
   const contrast = parseFloat(document.getElementById('ditherContrast').value);
-  const currentImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const currentImageData = ditherSourceImageData &&
+    ditherSourceImageData.width === canvas.width &&
+    ditherSourceImageData.height === canvas.height
+    ? ditherSourceImageData
+    : ctx.getImageData(0, 0, canvas.width, canvas.height);
   const imageData = new ImageData(
     new Uint8ClampedArray(currentImageData.data),
     currentImageData.width,
@@ -1708,12 +1894,20 @@ function convertDithering() {
   const finalImageData = decodeProcessedData(processedData, canvas.width, canvas.height, mode);
   ctx.putImageData(finalImageData, 0, 0);
 
-  paintManager.saveToHistory(); // Save dithered image to history
+  if (saveHistory) paintManager.saveToHistory(); // Save only committed changes
 }
 
 function applyDither() {
   if (cropManager && cropManager.commitPendingTransform) cropManager.commitPendingTransform(false);
   convertDithering();
+}
+
+function scheduleDitherPreview() {
+  if (ditherPreviewFrame) return;
+  ditherPreviewFrame = requestAnimationFrame(() => {
+    ditherPreviewFrame = 0;
+    applyDither();
+  });
 }
 
 function resetImageAdjustments() {
@@ -1742,16 +1936,16 @@ function initEventHandlers() {
   }
   document.getElementById("ditherStrength").addEventListener("input", (e) => {
     document.getElementById("ditherStrengthValue").innerText = parseFloat(e.target.value).toFixed(1);
-    applyDither();
+    scheduleDitherPreview();
   });
   document.getElementById("ditherContrast").addEventListener("input", (e) => {
     document.getElementById("ditherContrastValue").innerText = parseFloat(e.target.value).toFixed(1);
-    applyDither();
+    scheduleDitherPreview();
   });
   for (const id of ['ditherBrightness', 'ditherSaturation']) {
     document.getElementById(id).addEventListener('input', (e) => {
       document.getElementById(`${id}Value`).innerText = parseFloat(e.target.value).toFixed(1);
-      applyDither();
+      scheduleDitherPreview();
     });
   }
 }
@@ -2074,11 +2268,16 @@ if (typeof document !== 'undefined') document.body.onload = () => {
   ensureEditorCompatibilityControls();
   paintManager = new PaintManager(canvas, ctx);
   cropManager = new CropManager(canvas, ctx, paintManager);
-  cropManager.setRenderCallback((sourceImageData) => {
+  cropManager.setRenderCallback((sourceImageData, commitHistory = true) => {
     // Every completed drag/zoom/rotation must pass through the same dither
     // pipeline as the initial image load.
     ctx.putImageData(sourceImageData, 0, 0);
-    convertDithering();
+    ditherSourceImageData = new ImageData(
+      new Uint8ClampedArray(sourceImageData.data),
+      sourceImageData.width,
+      sourceImageData.height
+    );
+    convertDithering(commitHistory);
   });
 
   paintManager.initPaintTools();

@@ -64,8 +64,19 @@ class CropManager {
 
   refreshInteractionState() {
     const enabled = this.canTransform();
+    const hasOverlays = this.paintManager && this.paintManager.hasOverlayElements &&
+      this.paintManager.hasOverlayElements();
     this.canvas.parentNode.classList.toggle('image-transform-locked', this.hasImage() && !enabled);
-    this.setControlsEnabled(enabled);
+    // Transform buttons remain available while an empty editing tool is active;
+    // clicking one exits that tool first. Existing overlays stay protected.
+    this.setControlsEnabled(this.hasImage() && !hasOverlays);
+  }
+
+  prepareTransform() {
+    if (this.paintManager && this.paintManager.currentTool) {
+      this.paintManager.setActiveTool(null, '');
+    }
+    return this.canTransform();
   }
 
   loadFile(file) {
@@ -197,6 +208,12 @@ class CropManager {
     this.animationFrame = requestAnimationFrame(() => {
       this.animationFrame = 0;
       this.drawTransformedImage();
+      // Render the transformed source through the same preview pipeline used
+      // after a committed transform, without adding a history entry per frame.
+      if (this.renderCallback) {
+        const sourceImageData = this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
+        this.renderCallback(sourceImageData, false);
+      }
     });
   }
 
@@ -334,11 +351,23 @@ class CropManager {
     const zoomOut = document.getElementById('zoom-out-image');
     const zoomIn = document.getElementById('zoom-in-image');
     const resetTransform = document.getElementById('reset-transform');
-    if (rotateLeft) rotateLeft.addEventListener('click', () => this.rotateImage(-90));
-    if (rotateRight) rotateRight.addEventListener('click', () => this.rotateImage(90));
-    if (zoomOut) zoomOut.addEventListener('click', () => this.zoomImage(0.98, true));
-    if (zoomIn) zoomIn.addEventListener('click', () => this.zoomImage(1.02, true));
-    if (resetTransform) resetTransform.addEventListener('click', () => this.resetTransform(true));
+    if (rotateLeft) rotateLeft.addEventListener('click', () => {
+      if (this.prepareTransform()) this.rotateImage(-90);
+    });
+    if (rotateRight) rotateRight.addEventListener('click', () => {
+      if (this.prepareTransform()) this.rotateImage(90);
+    });
+    if (zoomOut) zoomOut.onclick = (event) => {
+      event.preventDefault();
+      if (this.prepareTransform()) this.zoomImage(0.99, true);
+    };
+    if (zoomIn) zoomIn.onclick = (event) => {
+      event.preventDefault();
+      if (this.prepareTransform()) this.zoomImage(1.01, true);
+    };
+    if (resetTransform) resetTransform.addEventListener('click', () => {
+      if (this.prepareTransform()) this.resetTransform(true);
+    });
     this.setControlsEnabled(false);
   }
 }
