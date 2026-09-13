@@ -62,7 +62,7 @@ function updateTimeReadouts() {
   }
 }
 
-if (typeof document !== 'undefined') {
+if (typeof document !== 'undefined' && typeof setInterval === 'function') {
   setInterval(updateTimeReadouts, 250);
   updateTimeReadouts();
 }
@@ -493,7 +493,7 @@ function resolveTimeSample(rawSeconds) {
   }
 }
 
-function waitForTimeSample(timeoutMs = 2500) {
+function waitForTimeSample(timeoutMs = 6000) {
   if (timeSampleWaiter) return Promise.resolve(null);
   return new Promise(resolve => {
     const waiter = { resolve: value => { clearTimeout(timer); resolve(value); } };
@@ -508,13 +508,21 @@ function waitForTimeSample(timeoutMs = 2500) {
 
 async function requestTimeSample() {
   if (!epdCharacteristic || !gattServer?.connected || bootloaderMode) return null;
-  const wait = waitForTimeSample();
-  const sentAt = performance.now();
-  if (!await write(EpdCmd.GET_TIME, new Uint8Array(0), false)) {
-    timeSampleWaiter = null;
-    return null;
+  let sample = null;
+  let sentAt = 0;
+  for (let attempt = 0; attempt < 3 && !sample; attempt++) {
+    const wait = waitForTimeSample(6000);
+    sentAt = performance.now();
+    // The firmware handles GET_TIME as a notification-triggering command;
+    // keep this as a write without response. Confirmed writes can be held by
+    // the peripheral while a display refresh is active and produce no t= reply.
+    if (!await write(EpdCmd.GET_TIME, new Uint8Array(0), false)) {
+      timeSampleWaiter = null;
+      return null;
+    }
+    sample = await wait;
+    if (!sample && attempt < 2) await delay(250);
   }
-  const sample = await wait;
   if (!sample) return null;
   const receivedAt = sample.receivedAt;
   // Compare against the local wall-clock representation used by firmware.
@@ -558,9 +566,10 @@ async function calibrateDeviceTime() {
   const started = performance.now();
   if (status) status.textContent = '正在校准设备时间...';
   const before = await requestTimeSample();
-  if (status) status.textContent = '正在测量晶振走时（约 30 秒）...';
-  // Whole-second replies need a long enough window to make ppm meaningful.
-  await new Promise(resolve => setTimeout(resolve, 30000));
+  if (status) status.textContent = '正在读取设备时间（约 6 秒）...';
+  // Crystal compensation is intentionally neutral; a short read window is
+  // sufficient for the manual/current-time correction.
+  await new Promise(resolve => setTimeout(resolve, 6000));
   const driftSample = await requestTimeSample();
   const elapsed = before && driftSample ? Math.max(1, (driftSample.receivedAt - before.receivedAt) / 1000) : 0;
   // GET_TIME has one-second resolution; endpoint differences are dominated by
@@ -581,6 +590,42 @@ async function calibrateDeviceTime() {
   const afterText = `${after.errorMs >= 0 ? '+' : ''}${after.errorMs.toFixed(0)} ms`;
   if (status) status.textContent = `已校准 · 频率补偿 ${ppm >= 0 ? '+' : ''}${ppm} ppm · 当前 ${afterText}`;
   addLog(`时间校准完成：校准前 ${beforeText}，当前 ${afterText}，晶振补偿 ${ppm >= 0 ? '+' : ''}${ppm} ppm，耗时 ${((performance.now() - started) / 1000).toFixed(2)} s`);
+}
+
+async function applyManualTimeOffset() {
+  if (!epdCharacteristic || !gattServer?.connected || bootloaderMode) {
+    addLog('请先连接应用固件设备后再应用手动时间补偿');
+    return;
+  }
+  const input = document.getElementById('manualTimeOffset');
+  const status = document.getElementById('timeCalibrationStatus');
+  const button = document.getElementById('applyManualTimeOffsetButton');
+  const offset = Number(input?.value);
+  if (!Number.isInteger(offset) || offset < -60 || offset > 60) {
+    if (status) status.textContent = '补偿范围必须是 -60 到 +60 秒';
+    return;
+  }
+  if (button) button.disabled = true;
+  if (status) status.textContent = `正在应用 ${offset >= 0 ? '+' : ''}${offset} 秒补偿...`;
+  try {
+    const target = Math.round(localWallClockMs() / 1000) + offset;
+    const data = new Uint8Array([
+      (target >> 24) & 0xFF, (target >> 16) & 0xFF,
+      (target >> 8) & 0xFF, target & 0xFF,
+      0, 1, 0, 0, 0, 0,
+    ]);
+    if (!await write(EpdCmd.SET_TIME, data, true)) throw new Error('设备未确认时间写入');
+    await delay(250);
+    const sample = await requestTimeSample();
+    const measured = sample ? sample.errorMs.toFixed(0) : '未读取';
+    if (status) status.textContent = `手动补偿已应用 ${offset >= 0 ? '+' : ''}${offset} 秒 · 当前误差 ${measured} ms`;
+    addLog(`手动时间补偿已应用：${offset >= 0 ? '+' : ''}${offset} 秒，当前误差 ${measured} ms`);
+  } catch (error) {
+    if (status) status.textContent = `手动补偿失败：${error.message}`;
+    addLog(`手动时间补偿失败：${error.message}`);
+  } finally {
+    if (button) button.disabled = false;
+  }
 }
 
 async function setCalendarTheme(theme) {
@@ -1799,27 +1844,22 @@ function delay(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
-async function sendFastOtaPayload(firmware) {
-  const mtu = Number(document.getElementById('mtusize')?.value) || 244;
-  const chunkSize = Math.min(OTA_FAST_CHUNK_SIZE, Math.max(1, mtu - 3));
-  // Fast DFU acknowledges only after its internal 1 KiB buffer is flushed.
-  // Keep the completion waiter armed while the browser streams raw ATT writes.
+async function sendReliableOtaPayload(firmware, targetAddress) {
   try {
-    for (let offset = 0; offset < firmware.length; offset += chunkSize) {
-      const chunk = firmware.subarray(offset, Math.min(offset + chunkSize, firmware.length));
-      await otaRxCharacteristic.writeValueWithoutResponse(chunk);
+    for (let offset = 0; offset < firmware.length; offset += OTA_CHUNK_SIZE) {
+      const chunk = firmware.subarray(offset, Math.min(offset + OTA_CHUNK_SIZE, firmware.length));
+      const payload = new Uint8Array(7 + chunk.length);
+      payload[0] = 1;
+      writeUint32LE(payload, 1, targetAddress + offset);
+      new DataView(payload.buffer).setUint16(5, chunk.length, true);
+      await expectDfuSuccess(DfuCmd.PROGRAM_FLASH, payload, 15000);
       const written = offset + chunk.length;
       const progress = 7 + (written / firmware.length) * 90;
       setOtaProgress(progress);
       updateOtaMetrics(written);
-      setOtaStatus(`正在快速写入固件 ${(written / 1024).toFixed(1)} / ${(firmware.length / 1024).toFixed(1)} KiB`);
+      setOtaStatus(`正在写入固件 ${(written / 1024).toFixed(1)} / ${(firmware.length / 1024).toFixed(1)} KiB`);
     }
-    // PROGRAM_END is the authoritative commit handshake.
   } catch (error) {
-    if (otaPendingSignal) {
-      clearTimeout(otaPendingSignal.timer);
-      otaPendingSignal = null;
-    }
     throw error;
   }
 }
@@ -1855,7 +1895,7 @@ async function startOtaUpgrade() {
   otaTransferStats = {
     startedAt: performance.now(),
     transferStartedAt: performance.now(),
-    totalBytes: otaSelectedPackage.transferBytes.length,
+    totalBytes: otaSelectedPackage.bytes.length,
   };
   updateButtonStatus(true);
   setOtaProgress(1);
@@ -1884,33 +1924,24 @@ async function startOtaUpgrade() {
     await delay(150);
 
     const startPayload = new Uint8Array(1 + OTA_IMAGE_INFO_SIZE);
-    // SDK DFU fast-inner mode (0x02) avoids a response round-trip per chunk.
-    startPayload[0] = 0x02;
+    // Use the acknowledged DFU path for compatibility with the stable
+    // bootloader implementation. Each flash block is confirmed before the
+    // next block is sent.
+    startPayload[0] = 0;
     startPayload.set(otaSelectedPackage.imageInfo, 1);
     // In copy mode Goodix expects load_addr to point at the staging bank while
     // run_addr remains the final application address. Bootloader rescue writes
     // directly to the original application address in non-copy mode.
     writeUint32LE(startPayload, 1 + 12, targetAddress);
     setOtaStatus(bootloaderMode ? '正在恢复应用固件' : '正在擦除 OTA 暂存区');
-    const eraseComplete = waitForDfuSignal(
-      DfuCmd.PROGRAM_START,
-      data => data.length >= 2 && data[0] === 1 && data[1] === 3,
-      60000,
-    );
-    await expectDfuSuccess(
-      DfuCmd.PROGRAM_START,
-      startPayload,
-      60000,
-      data => data.length >= 1 && (data[0] !== 1 || data[1] === 1),
-    );
-    await eraseComplete;
-    addLog('OTA 快速模式擦除完成，开始连续传输');
+    await expectDfuSuccess(DfuCmd.PROGRAM_START, startPayload, 60000);
+    addLog('OTA 擦除完成，开始逐块确认传输');
     setOtaProgress(7);
     otaTransferStats.transferStartedAt = performance.now();
     updateOtaMetrics(0);
 
-    const firmware = otaSelectedPackage.transferBytes;
-    await sendFastOtaPayload(firmware);
+    const firmware = otaSelectedPackage.bytes;
+    await sendReliableOtaPayload(firmware, targetAddress);
 
     const endPayload = new Uint8Array(5);
     endPayload[0] = 1;
@@ -1933,7 +1964,7 @@ async function startOtaUpgrade() {
     if (e.otaRestartExpected) {
       otaCompletedAwaitingRestart = true;
       setOtaProgress(100);
-      updateOtaMetrics(otaSelectedPackage.transferBytes.length, true);
+      updateOtaMetrics(otaSelectedPackage.bytes.length, true);
       setOtaStatus('OTA 传输已完成，设备正在重启；请重连确认版本', 'success');
       addLog('PROGRAM_END 已提交，断开属于设备重启阶段');
     } else {

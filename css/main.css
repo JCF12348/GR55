@@ -1866,6 +1866,9 @@ body.custom-background .log-container { background: rgba(24,33,44,.94); }
   white-space: nowrap;
 }
 
+.manual-time-offset { white-space: nowrap; }
+#manualTimeOffset { width: 64px; min-width: 64px; }
+
 @media (max-width: 640px) {
   .time-calibration-status { flex-basis: 100%; white-space: normal; }
 }

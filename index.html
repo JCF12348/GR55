@@ -135,6 +135,10 @@
 					<button id="otaToggleButton" type="button" class="secondary" aria-expanded="false" aria-controls="otaPanel" onclick="toggleOtaPanel()">OTA 升级</button>
 					<button id="measureClockButton" type="button" class="secondary" onclick="measureDeviceClock()" title="连续读取设备时间并与电脑时钟比较">测量时钟误差</button>
 					<button id="calibrateClockButton" type="button" class="primary" onclick="calibrateDeviceTime()" title="将设备时间校准为当前电脑时间">校准设备时间</button>
+					<label class="manual-time-offset" for="manualTimeOffset">手动补偿</label>
+					<input id="manualTimeOffset" type="number" min="-60" max="60" step="1" value="0" title="相对电脑当前时间补偿，单位：秒">
+					<span>秒</span>
+					<button id="applyManualTimeOffsetButton" type="button" class="secondary" onclick="applyManualTimeOffset()" title="按输入的秒数调整设备时间">应用补偿</button>
 					<span id="timeCalibrationStatus" class="time-calibration-status" role="status" aria-live="polite">未测量</span>
 					<span class="time-readout"><span class="time-readout-label">设备时间</span><strong id="deviceTimeReadout">--:--:--</strong></span>
 					<span class="time-readout"><span class="time-readout-label">系统时间</span><strong id="systemTimeReadout">--:--:--</strong></span>
