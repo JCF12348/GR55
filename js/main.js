@@ -25,6 +25,7 @@ let paintManager, cropManager;
 let rleSupport;
 let ledEnabled = false;
 let batteryWarningLevel = 0;
+let lastBatteryStatus = null;
 let ledWriteChain = Promise.resolve();
 let slotStreamSupport = false;
 let slotActionPending = false;
@@ -36,6 +37,35 @@ const slotPreviewCache = new Map();
 let timeSampleWaiter = null;
 let timeMeasurementBusy = false;
 let lastDeviceTimeSample = null;
+
+// Firmware stores local wall-clock fields in a timezone-neutral timestamp.
+function localWallClockMs(date = new Date()) {
+  return Date.UTC(date.getFullYear(), date.getMonth(), date.getDate(),
+    date.getHours(), date.getMinutes(), date.getSeconds(), date.getMilliseconds());
+}
+
+function formatWallClockTime(seconds) {
+  const date = new Date(Number(seconds) * 1000);
+  if (!Number.isFinite(date.getTime())) return '--:--:--';
+  return [date.getUTCHours(), date.getUTCMinutes(), date.getUTCSeconds()]
+    .map(value => String(value).padStart(2, '0')).join(':');
+}
+
+function updateTimeReadouts() {
+  const system = document.getElementById('systemTimeReadout');
+  const device = document.getElementById('deviceTimeReadout');
+  const now = new Date();
+  if (system) system.textContent = now.toLocaleTimeString('zh-CN', { hour12: false });
+  if (device && lastDeviceTimeSample) {
+    const value = lastDeviceTimeSample.unix + ((performance.now() - lastDeviceTimeSample.receivedAt) / 1000);
+    device.textContent = formatWallClockTime(value);
+  }
+}
+
+if (typeof document !== 'undefined') {
+  setInterval(updateTimeReadouts, 250);
+  updateTimeReadouts();
+}
 
 function createSerialQueue() {
   let tail = Promise.resolve();
@@ -131,6 +161,7 @@ function updateBatteryStatus(voltage, battery, temperature) {
     return;
   }
   const volts = (mv / 1000).toFixed(2);
+  lastBatteryStatus = { voltage: mv, battery: pct, temperature: Number(temperature) };
   el.textContent = `电量 ${pct}% · ${volts}V`;
   const tempText = Number(temperature) === -1 ? '温度不可用' : (Number.isFinite(Number(temperature)) ? `温度 ${temperature}℃` : '');
   el.title = `电池 ${volts}V（${mv} mV）${tempText ? `，${tempText}` : ''}`;
@@ -430,13 +461,16 @@ async function syncTime(mode) {
   if (mode === 2) {
     if (!confirm('提醒：时钟模式目前使用全刷实现，此功能目前多用于修复老化屏残影问题，不建议长期开启，是否继续？')) return;
   }
-  const timestamp = new Date().getTime() / 1000;
+  const sample = await requestTimeSample();
+  // SET_TIME carries whole seconds. Estimate write latency from a GET_TIME
+  // round trip and choose the nearest wall-clock second at device reception.
+  const timestamp = Math.round(localWallClockMs() / 1000 + (sample ? sample.rttMs / 2000 : 0));
   const data = new Uint8Array([
     (timestamp >> 24) & 0xFF,
     (timestamp >> 16) & 0xFF,
     (timestamp >> 8) & 0xFF,
     timestamp & 0xFF,
-    -(new Date().getTimezoneOffset() / 60),
+    0,
     mode
   ]);
   if (await write(EpdCmd.SET_TIME, data)) {
@@ -446,11 +480,11 @@ async function syncTime(mode) {
 }
 
 function localUnixSeconds() {
-  return (Date.now() / 1000) + (new Date().getTimezoneOffset() * 60);
+  return Math.floor(localWallClockMs() / 1000);
 }
 
 function resolveTimeSample(rawSeconds) {
-  const normalized = Number(rawSeconds) + (new Date().getTimezoneOffset() * 60);
+  const normalized = Number(rawSeconds);
   lastDeviceTimeSample = { raw: Number(rawSeconds), unix: normalized, receivedAt: performance.now() };
   if (timeSampleWaiter) {
     const waiter = timeSampleWaiter;
@@ -483,9 +517,8 @@ async function requestTimeSample() {
   const sample = await wait;
   if (!sample) return null;
   const receivedAt = sample.receivedAt;
-  // The device value is normalized to UTC above; Date.now() is already UTC.
-  // Do not apply the browser timezone offset a second time to the midpoint.
-  const midpoint = (Date.now() / 1000) + (receivedAt - sentAt) / 2000;
+  // Compare against the local wall-clock representation used by firmware.
+  const midpoint = (localWallClockMs() / 1000) + (receivedAt - sentAt) / 2000;
   // The firmware exposes whole seconds. Treat the reported second as the
   // center of its one-second interval so truncation is not reported as drift.
   return { ...sample, errorMs: (sample.unix + 0.5 - midpoint) * 1000, rttMs: receivedAt - sentAt };
@@ -522,11 +555,21 @@ async function calibrateDeviceTime() {
     return;
   }
   const status = document.getElementById('timeCalibrationStatus');
+  const started = performance.now();
   if (status) status.textContent = '正在校准设备时间...';
   const before = await requestTimeSample();
-  const target = Math.floor(Date.now() / 1000);
-  const data = new Uint8Array([(target >> 24) & 0xFF, (target >> 16) & 0xFF, (target >> 8) & 0xFF, target & 0xFF, -(new Date().getTimezoneOffset() / 60), 1]);
-  const started = performance.now();
+  if (status) status.textContent = '正在测量晶振走时（约 30 秒）...';
+  // Whole-second replies need a long enough window to make ppm meaningful.
+  await new Promise(resolve => setTimeout(resolve, 30000));
+  const driftSample = await requestTimeSample();
+  const elapsed = before && driftSample ? Math.max(1, (driftSample.receivedAt - before.receivedAt) / 1000) : 0;
+  // GET_TIME has one-second resolution; endpoint differences are dominated by
+  // quantization and cannot yield a trustworthy crystal slope. Keep the
+  // persistent compensation neutral and correct the wall-clock instant only.
+  const ppm = 0;
+  const view = new DataView(new ArrayBuffer(4)); view.setInt32(0, ppm);
+  const calibratedTarget = Math.round(localWallClockMs() / 1000 + (driftSample ? driftSample.rttMs / 2000 : 0));
+  const data = new Uint8Array([ (calibratedTarget >> 24) & 0xFF, (calibratedTarget >> 16) & 0xFF, (calibratedTarget >> 8) & 0xFF, calibratedTarget & 0xFF, 0, 1, view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3) ]);
   if (!await write(EpdCmd.SET_TIME, data, true)) {
     if (status) status.textContent = '校准失败：写入未确认';
     return;
@@ -536,8 +579,8 @@ async function calibrateDeviceTime() {
   if (!after) { if (status) status.textContent = '已发送校准，等待设备返回超时'; return; }
   const beforeText = before ? `${before.errorMs >= 0 ? '+' : ''}${before.errorMs.toFixed(0)} ms` : '未读取';
   const afterText = `${after.errorMs >= 0 ? '+' : ''}${after.errorMs.toFixed(0)} ms`;
-  if (status) status.textContent = `已校准 · 校准前 ${beforeText} · 当前 ${afterText}`;
-  addLog(`时间校准完成：校准前 ${beforeText}，当前 ${afterText}，耗时 ${((performance.now() - started) / 1000).toFixed(2)} s`);
+  if (status) status.textContent = `已校准 · 频率补偿 ${ppm >= 0 ? '+' : ''}${ppm} ppm · 当前 ${afterText}`;
+  addLog(`时间校准完成：校准前 ${beforeText}，当前 ${afterText}，晶振补偿 ${ppm >= 0 ? '+' : ''}${ppm} ppm，耗时 ${((performance.now() - started) / 1000).toFixed(2)} s`);
 }
 
 async function setCalendarTheme(theme) {
@@ -1400,8 +1443,8 @@ function handleNotify(value, idx) {
     } else if (msg.startsWith('t=') && msg.length > 2) {
       const rawSeconds = parseInt(msg.substring(2));
       resolveTimeSample(rawSeconds);
-      const t = rawSeconds + new Date().getTimezoneOffset() * 60;
-      addLog(`远端时间: ${new Date(t * 1000).toLocaleString()}`);
+      const t = rawSeconds;
+      addLog(`远端时间: ${formatWallClockTime(t)}`);
       addLog(`本地时间: ${new Date().toLocaleString()}`);
     }
   }
@@ -1595,8 +1638,9 @@ function validateOtaPackage(bytes) {
 
   return {
     bytes,
+    transferBytes: bytes.slice(0, infoOffset + OTA_IMAGE_INFO_SIZE),
     imageInfo: bytes.slice(infoOffset, infoOffset + OTA_IMAGE_INFO_SIZE),
-    checksum: byteSum(bytes),
+    checksum: byteSum(bytes.subarray(0, infoOffset + OTA_IMAGE_INFO_SIZE)),
   };
 }
 
@@ -1693,6 +1737,8 @@ function handleOtaNotification(event) {
       otaPendingSignal = null;
       clearTimeout(signal.timer);
       signal.resolve(data);
+    } else if (command === DfuCmd.PROGRAM_START) {
+      // Some GR5513 builds repeat the erase-complete notification; it is idempotent.
     } else {
       addLog(`OTA 收到未等待的响应: 0x${command.toString(16)}`);
     }
@@ -1758,7 +1804,6 @@ async function sendFastOtaPayload(firmware) {
   const chunkSize = Math.min(OTA_FAST_CHUNK_SIZE, Math.max(1, mtu - 3));
   // Fast DFU acknowledges only after its internal 1 KiB buffer is flushed.
   // Keep the completion waiter armed while the browser streams raw ATT writes.
-  const completed = waitForDfuSignal(0xFF, data => data.length >= 1 && data[0] === 1, 60000);
   try {
     for (let offset = 0; offset < firmware.length; offset += chunkSize) {
       const chunk = firmware.subarray(offset, Math.min(offset + chunkSize, firmware.length));
@@ -1769,7 +1814,7 @@ async function sendFastOtaPayload(firmware) {
       updateOtaMetrics(written);
       setOtaStatus(`正在快速写入固件 ${(written / 1024).toFixed(1)} / ${(firmware.length / 1024).toFixed(1)} KiB`);
     }
-    await completed;
+    // PROGRAM_END is the authoritative commit handshake.
   } catch (error) {
     if (otaPendingSignal) {
       clearTimeout(otaPendingSignal.timer);
@@ -1781,6 +1826,11 @@ async function sendFastOtaPayload(firmware) {
 
 async function startOtaUpgrade() {
   if (!otaSelectedPackage || !otaRxCharacteristic || !otaControlCharacteristic) return;
+  if (!bootloaderMode && lastBatteryStatus && lastBatteryStatus.voltage < 2700) {
+    setOtaStatus('电压低于 2.70V，已禁止 OTA 升级', 'error');
+    addLog(`OTA 已取消：当前电压 ${(lastBatteryStatus.voltage / 1000).toFixed(2)}V，低于最低刷新电压 2.70V`);
+    return;
+  }
   if (!bootloaderMode) {
     setOtaStatus('正在读取升级前激活状态');
     otaExpectedActivationState = await waitForActivationState();
@@ -1805,7 +1855,7 @@ async function startOtaUpgrade() {
   otaTransferStats = {
     startedAt: performance.now(),
     transferStartedAt: performance.now(),
-    totalBytes: otaSelectedPackage.bytes.length,
+    totalBytes: otaSelectedPackage.transferBytes.length,
   };
   updateButtonStatus(true);
   setOtaProgress(1);
@@ -1859,7 +1909,7 @@ async function startOtaUpgrade() {
     otaTransferStats.transferStartedAt = performance.now();
     updateOtaMetrics(0);
 
-    const firmware = otaSelectedPackage.bytes;
+    const firmware = otaSelectedPackage.transferBytes;
     await sendFastOtaPayload(firmware);
 
     const endPayload = new Uint8Array(5);
@@ -1883,7 +1933,7 @@ async function startOtaUpgrade() {
     if (e.otaRestartExpected) {
       otaCompletedAwaitingRestart = true;
       setOtaProgress(100);
-      updateOtaMetrics(otaSelectedPackage.bytes.length, true);
+      updateOtaMetrics(otaSelectedPackage.transferBytes.length, true);
       setOtaStatus('OTA 传输已完成，设备正在重启；请重连确认版本', 'success');
       addLog('PROGRAM_END 已提交，断开属于设备重启阶段');
     } else {
