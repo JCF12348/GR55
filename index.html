@@ -6,7 +6,7 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>墨水屏日历</title>
 	<link rel="shortcut icon" type="image/png" href="favicon.png">
-	<link rel="stylesheet" href="css/main.css?v=20260912-mobile-dither-width">
+	<link rel="stylesheet" href="css/main.css?v=20260915-preview-noise-fix">
 </head>
 
 	<body>
@@ -42,24 +42,24 @@
 				<div class="flex-group right debug">
 					<label for="epddriver">驱动</label>
 					<select id="epddriver" onchange="updateDitcherOptions()">
-						<option value="01" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, UC8176)</option>
-						<option value="03" data-color="threeColor" data-size="4.2_400_300">4.2寸 (三色, UC8176)</option>
-<option value="13" data-color="threeColor" data-size="2.13_250_122">2.13寸 (三色, UC8151D, 横屏)</option>
-						<option value="04" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, SSD1619)</option>
+						<option value="01" data-advanced-driver="true" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, UC8176)</option>
+						<option value="03" data-advanced-driver="true" data-color="threeColor" data-size="4.2_400_300">4.2寸 (三色, UC8176)</option>
+						<option value="13" data-color="threeColor" data-size="2.13_250_122">2.13寸 (三色, UC8151D, 横屏)</option>
+						<option value="04" data-advanced-driver="true" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, SSD1619)</option>
 						<option value="02" data-color="threeColor" data-size="4.2_400_300" selected>4.2寸 (三色, SSD1619)</option>
-						<option value="05" data-color="fourColor" data-size="4.2_400_300">4.2寸 (四色, JD79668)</option>
-						<option value="0f" data-color="blackWhiteColor" data-size="5.83_600_448">5.83寸低分 (黑白, UC8159)</option>
-						<option value="0e" data-color="threeColor" data-size="5.83_600_448">5.83寸低分 (三色, UC8159)</option>
-						<option value="11" data-color="blackWhiteColor" data-size="5.83_648_480">5.83寸 (黑白, UC8179)</option>
-						<option value="10" data-color="threeColor" data-size="5.83_648_480">5.83寸 (三色, UC8179)</option>
-						<option value="0d" data-color="fourColor" data-size="5.83_648_480">5.83寸 (四色, JD79665)</option>
-						<option value="06" data-color="blackWhiteColor" data-size="7.5_800_480">7.5寸 (黑白, UC8179)</option>
-						<option value="07" data-color="threeColor" data-size="7.5_800_480">7.5寸 (三色, UC8179)</option>
-						<option value="0c" data-color="fourColor" data-size="7.5_800_480">7.5寸 (四色, JD79665)</option>
-						<option value="08" data-color="blackWhiteColor" data-size="7.5_640_384">7.5寸低分 (黑白, UC8159)</option>
-						<option value="09" data-color="threeColor" data-size="7.5_640_384">7.5寸低分 (三色, UC8159)</option>
-						<option value="0a" data-color="blackWhiteColor" data-size="7.5_880_528">7.5寸HD (黑白, SSD1677)</option>
-						<option value="0b" data-color="threeColor" data-size="7.5_880_528">7.5寸HD (三色, SSD1677)</option>
+						<option value="05" data-advanced-driver="true" data-color="fourColor" data-size="4.2_400_300">4.2寸 (四色, JD79668)</option>
+						<option value="0f" data-advanced-driver="true" data-color="blackWhiteColor" data-size="5.83_600_448">5.83寸低分 (黑白, UC8159)</option>
+						<option value="0e" data-advanced-driver="true" data-color="threeColor" data-size="5.83_600_448">5.83寸低分 (三色, UC8159)</option>
+						<option value="11" data-advanced-driver="true" data-color="blackWhiteColor" data-size="5.83_648_480">5.83寸 (黑白, UC8179)</option>
+						<option value="10" data-advanced-driver="true" data-color="threeColor" data-size="5.83_648_480">5.83寸 (三色, UC8179)</option>
+						<option value="0d" data-advanced-driver="true" data-color="fourColor" data-size="5.83_648_480">5.83寸 (四色, JD79665)</option>
+						<option value="06" data-advanced-driver="true" data-color="blackWhiteColor" data-size="7.5_800_480">7.5寸 (黑白, UC8179)</option>
+						<option value="07" data-advanced-driver="true" data-color="threeColor" data-size="7.5_800_480">7.5寸 (三色, UC8179)</option>
+						<option value="0c" data-advanced-driver="true" data-color="fourColor" data-size="7.5_800_480">7.5寸 (四色, JD79665)</option>
+						<option value="08" data-advanced-driver="true" data-color="blackWhiteColor" data-size="7.5_640_384">7.5寸低分 (黑白, UC8159)</option>
+						<option value="09" data-advanced-driver="true" data-color="threeColor" data-size="7.5_640_384">7.5寸低分 (三色, UC8159)</option>
+						<option value="0a" data-advanced-driver="true" data-color="blackWhiteColor" data-size="7.5_880_528">7.5寸HD (黑白, SSD1677)</option>
+						<option value="0b" data-advanced-driver="true" data-color="threeColor" data-size="7.5_880_528">7.5寸HD (三色, SSD1677)</option>
 					</select>
 				</div>
 				<div class="flex-group debug">
@@ -259,11 +259,45 @@
 					<label for="ditherAlg">抖动算法:</label>
 					<select id="ditherAlg" onchange="applyDither()">
 						<option value="floydSteinberg">Floyd-Steinberg</option>
+						<option value="tgzAuto">TGZ-自动抖动</option>
 						<option value="atkinson">Atkinson</option>
 						<option value="bayer">Bayer</option>
 						<option value="stucki">Stucki</option>
 						<option value="jarvis">Jarvis-Judice-Ninke</option>
 						<option value="none">无抖动</option>
+						<option value="epdOptimize">智能墨水屏优化</option>
+					</select>
+				</div>
+				<div class="flex-group tgz-filter-control">
+					<label for="tgzFilter">滤镜:</label>
+					<select id="tgzFilter" onchange="applyDither()">
+						<option value="none" selected>无滤镜</option>
+						<option value="contrastWarm">官方默认</option>
+						<option value="outdoor">户外</option>
+						<option value="amberFilm">琥珀映画</option>
+						<option value="filmNoirColor">彩色电影</option>
+						<option value="vintageSlide">反转片</option>
+						<option value="iphone4">iPhone4</option>
+						<option value="coldFilm">冷白皮</option>
+						<option value="nostalgia">古早风</option>
+						<option value="y2k">千禧风</option>
+						<option value="grayscale">灰度</option>
+						<option value="pureBlackWhite">黑白</option>
+						<option value="highContrastBW">高对比黑白</option>
+						<option value="crushBW">黑白场</option>
+						<option value="filmNoir">黑色电影</option>
+						<option value="pencil">铅笔</option>
+						<option value="colorPencil">彩铅</option>
+						<option value="sepia">棕褐</option>
+						<option value="redWhite">红白</option>
+						<option value="blackYellow">黑黄</option>
+						<option value="chrome">铬黄</option>
+						<option value="chromeRed">铬红</option>
+						<option value="redTriTone">黑白红</option>
+						<option value="yellowTriTone">黑白黄</option>
+						<option value="pureRedBlack">红色调</option>
+						<option value="pureYellowBlack">黄色调</option>
+						<option value="color">彩色</option>
 					</select>
 				</div>
 				<div class="flex-group image-range-group strength-range">
@@ -278,13 +312,13 @@
 				</div>
 				<div class="flex-group image-range-group brightness-range">
 					<label for="ditherBrightness">亮度:</label>
-					<input type="range" min="0.5" max="1.5" step="0.1" value="1.0" id="ditherBrightness">
-					<label id="ditherBrightnessValue">1.0</label>
+					<input type="range" min="-80" max="80" step="1" value="0" id="ditherBrightness">
+					<label id="ditherBrightnessValue">0</label>
 				</div>
 				<div class="flex-group image-range-group saturation-range">
 					<label for="ditherSaturation">饱和度:</label>
-					<input type="range" min="0" max="2" step="0.1" value="1.0" id="ditherSaturation">
-					<label id="ditherSaturationValue">1.0</label>
+					<input type="range" min="0" max="2.5" step="0.1" value="1.2" id="ditherSaturation">
+					<label id="ditherSaturationValue">1.2</label>
 				</div>
 			</div>
 			<div class="flex-container options image-transport-options">
@@ -465,11 +499,15 @@
 			<div class="modal-actions"><button id="resetBackgroundAdjustments" type="button" class="secondary">重置调节</button><button id="doneBackgroundSettings" type="button" class="primary">完成</button></div>
 		</div>
 	</div>
-	<script type="text/javascript" src="js/dithering.js"></script>
+	<script type="text/javascript" src="js/tgz-filter-curves.js?v=20260915-tgz"></script>
+	<script type="text/javascript" src="js/tgz-filter-lut.js?v=20260915-tgz"></script>
+	<script type="text/javascript" src="js/tgz-filters.js?v=20260915-tgz"></script>
+	<script type="text/javascript" src="js/tgz-dither-luts.js?v=20260915-tgz"></script>
+	<script type="text/javascript" src="js/dithering.js?v=20260915-tgz"></script>
 	<script type="text/javascript" src="js/rle.js"></script>
 	<script type="text/javascript" src="js/paint.js?v=20260912-brush-eraser-toggle"></script>
 	<script type="text/javascript" src="js/crop.js?v=20260912-image-default-actions"></script>
-	<script type="text/javascript" src="js/main.js?v=20260912-image-default-actions"></script>
+	<script type="text/javascript" src="js/main.js?v=20260915-preview-fix"></script>
 	<script>
 		var _hmt = _hmt || [];
 		(function () {

@@ -21,6 +21,8 @@ let startTime, msgIndex, appVersion;
 let canvas, ctx, textDecoder;
 let ditherPreviewFrame = 0;
 let ditherSourceImageData = null;
+let ditherPreviewActive = false;
+let advancedDriverOptionsVisible = false;
 let paintManager, cropManager;
 let rleSupport;
 let ledEnabled = false;
@@ -990,6 +992,10 @@ async function sendcmd() {
     return;
   }
   const compact = cmdTXT.replace(/[\s-]/g, '');
+  if (compact === '12348') {
+    setAdvancedDriverOptionsVisible(true);
+    return;
+  }
   if (compact.length === 418) {
     const certificate = hex2bytes(compact);
     document.getElementById('activationCode').value = compact;
@@ -1864,6 +1870,20 @@ async function sendReliableOtaPayload(firmware, targetAddress) {
   }
 }
 
+function setAdvancedDriverOptionsVisible(visible) {
+  advancedDriverOptionsVisible = Boolean(visible);
+  document.querySelectorAll('#epddriver option[data-advanced-driver="true"]').forEach((option) => {
+    option.hidden = !advancedDriverOptionsVisible;
+    option.style.display = advancedDriverOptionsVisible ? '' : 'none';
+  });
+}
+
+function initDriverSelector() {
+  const selector = document.getElementById('epddriver');
+  if (!selector) return;
+  setAdvancedDriverOptionsVisible(false);
+}
+
 async function startOtaUpgrade() {
   if (!otaSelectedPackage || !otaRxCharacteristic || !otaControlCharacteristic) return;
   if (!bootloaderMode && lastBatteryStatus && lastBatteryStatus.voltage < 2700) {
@@ -2038,21 +2058,32 @@ function setCanvasTitle(title) {
 
 function updateImage() {
   const imageFile = document.getElementById('imageFile');
+  resetDitherPreviewSource();
   if (imageFile.files.length == 0) {
     if (cropManager && cropManager.clearImage) cropManager.clearImage();
     fillCanvas('white');
     return;
   }
   const file = imageFile.files[0];
+  resetPaintForImageLoad();
   cropManager.loadFile(file).then(() => {
     paintManager.setActiveTool(null, '');
   }).catch((error) => {
+    cropManager.clearImage();
     addLog(`图片加载失败: ${error.message || error}`);
     fillCanvas('white');
   });
 }
 
+function resetPaintForImageLoad() {
+  if (!paintManager) return;
+  paintManager.setActiveTool(null, '');
+  paintManager.clearElements();
+  paintManager.clearHistory();
+}
+
 function updateCanvasSize() {
+  resetDitherPreviewSource();
   const selectedSizeName = document.getElementById('canvasSize').value;
   const selectedSize = canvasSizes.find(size => size.name === selectedSizeName);
 
@@ -2070,6 +2101,9 @@ function updateDitcherOptions() {
 
   if (colorMode) document.getElementById('ditherMode').value = colorMode;
   if (canvasSize) document.getElementById('canvasSize').value = canvasSize;
+  if (typeof updateTgzOfficialFilterAvailability === 'function') {
+    updateTgzOfficialFilterAvailability(colorMode || document.getElementById('ditherMode').value);
+  }
 
   updateCanvasSize(); // always update image
 }
@@ -2108,45 +2142,106 @@ function clearCanvas() {
     fillCanvas('white');
     paintManager.clearElements(); // Clear stored text positions and line segments
     if (cropManager && cropManager.clearImage) cropManager.clearImage();
+    const imageFile = document.getElementById('imageFile');
+    if (imageFile) imageFile.value = '';
+    if (paintManager.setBaseImageData) paintManager.setBaseImageData();
     paintManager.saveToHistory(); // Save cleared canvas to history
     return true;
   }
   return false;
 }
 
+function getDitherSettings() {
+  return {
+    contrast: parseFloat(document.getElementById('ditherContrast').value),
+    brightness: parseFloat(document.getElementById('ditherBrightness').value),
+    saturation: parseFloat(document.getElementById('ditherSaturation').value),
+    alg: document.getElementById('ditherAlg').value,
+    strength: parseFloat(document.getElementById('ditherStrength').value),
+    mode: document.getElementById('ditherMode').value,
+    filter: document.getElementById('tgzFilter')?.value || 'none'
+  };
+}
+
+function resetDitherPreviewSource() {
+  ditherSourceImageData = null;
+  ditherPreviewActive = false;
+}
+
+function prepareDitherImageData(sourceImageData, settings) {
+  const imageData = new ImageData(
+    new Uint8ClampedArray(sourceImageData.data),
+    sourceImageData.width,
+    sourceImageData.height
+  );
+
+  // Match the V1.7 editor: brightness is an additive offset (-80..80),
+  // saturation is a multiplier, and every preview starts from the source.
+  adjustBrightnessSaturation(imageData, settings.brightness, settings.saturation);
+  adjustContrast(imageData, settings.contrast);
+  return imageData;
+}
+
+function processCanvasImageData() {
+  const settings = getDitherSettings();
+  if (!ditherPreviewActive || !ditherSourceImageData ||
+      ditherSourceImageData.width !== canvas.width ||
+      ditherSourceImageData.height !== canvas.height) {
+    ditherSourceImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  }
+
+  const imageData = prepareDitherImageData(ditherSourceImageData, settings);
+  const filteredImageData = typeof applyTgzFilter === 'function'
+    ? applyTgzFilter(imageData, settings.filter)
+    : imageData;
+  return processImageData(
+    ditherImage(
+      filteredImageData,
+      settings.alg,
+      settings.strength,
+      settings.mode,
+      settings.alg === 'tgzAuto' ? { filter: settings.filter } : {}
+    ),
+    settings.mode
+  );
+}
+
+// Render a transformed source in one pass. Keeping the source snapshot
+// separate from the processed canvas prevents old dithered pixels or editor
+// overlays from being fed back into the next preview frame.
+function renderTransformedImagePreview(sourceImageData, commitHistory = false) {
+  ditherSourceImageData = new ImageData(
+    new Uint8ClampedArray(sourceImageData.data),
+    sourceImageData.width,
+    sourceImageData.height
+  );
+  ditherPreviewActive = true;
+
+  const settings = getDitherSettings();
+  const processedData = processCanvasImageData();
+  const finalImageData = decodeProcessedData(
+    processedData,
+    canvas.width,
+    canvas.height,
+    settings.mode
+  );
+  ctx.putImageData(finalImageData, 0, 0);
+
+  if (paintManager && paintManager.setBaseImageData) paintManager.setBaseImageData();
+  if (commitHistory && paintManager) {
+    paintManager.clearHistory();
+    paintManager.saveToHistory();
+  }
+}
+
 function convertDithering(saveHistory = true) {
   paintManager.redrawTextElements();
   paintManager.redrawLineSegments();
-
-  const contrast = parseFloat(document.getElementById('ditherContrast').value);
-  const currentImageData = ditherSourceImageData &&
-    ditherSourceImageData.width === canvas.width &&
-    ditherSourceImageData.height === canvas.height
-    ? ditherSourceImageData
-    : ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const imageData = new ImageData(
-    new Uint8ClampedArray(currentImageData.data),
-    currentImageData.width,
-    currentImageData.height
-  );
-
-  adjustContrast(imageData, contrast);
-  const brightness = parseFloat(document.getElementById('ditherBrightness')?.value || '1');
-  const saturation = parseFloat(document.getElementById('ditherSaturation')?.value || '1');
-  for (let i = 0; i < imageData.data.length; i += 4) {
-    const r = imageData.data[i], g = imageData.data[i + 1], b = imageData.data[i + 2];
-    const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-    imageData.data[i] = Math.max(0, Math.min(255, gray + (r - gray) * saturation) * brightness);
-    imageData.data[i + 1] = Math.max(0, Math.min(255, gray + (g - gray) * saturation) * brightness);
-    imageData.data[i + 2] = Math.max(0, Math.min(255, gray + (b - gray) * saturation) * brightness);
-  }
-
-  const alg = document.getElementById('ditherAlg').value;
-  const strength = parseFloat(document.getElementById('ditherStrength').value);
-  const mode = document.getElementById('ditherMode').value;
-  const processedData = processImageData(ditherImage(imageData, alg, strength, mode), mode);
-  const finalImageData = decodeProcessedData(processedData, canvas.width, canvas.height, mode);
+  const settings = getDitherSettings();
+  const processedData = processCanvasImageData();
+  const finalImageData = decodeProcessedData(processedData, canvas.width, canvas.height, settings.mode);
   ctx.putImageData(finalImageData, 0, 0);
+  ditherPreviewActive = true;
 
   if (saveHistory) paintManager.saveToHistory(); // Save only committed changes
 }
@@ -2165,14 +2260,16 @@ function scheduleDitherPreview() {
 }
 
 function resetImageAdjustments() {
-  const defaults = { ditherStrength: 1, ditherContrast: 1.2, ditherBrightness: 1, ditherSaturation: 1 };
+  const defaults = { ditherStrength: 1, ditherContrast: 1.2, ditherBrightness: 0, ditherSaturation: 1.2 };
   for (const [id, value] of Object.entries(defaults)) {
     const control = document.getElementById(id);
     if (!control) continue;
     control.value = value;
     const output = document.getElementById(`${id}Value`);
-    if (output) output.textContent = Number(value).toFixed(1);
+    if (output) output.textContent = id === 'ditherBrightness' ? '0' : Number(value).toFixed(1);
   }
+  const filter = document.getElementById('tgzFilter');
+  if (filter) filter.value = 'none';
   applyDither();
 }
 
@@ -2198,7 +2295,9 @@ function initEventHandlers() {
   });
   for (const id of ['ditherBrightness', 'ditherSaturation']) {
     document.getElementById(id).addEventListener('input', (e) => {
-      document.getElementById(`${id}Value`).innerText = parseFloat(e.target.value).toFixed(1);
+      document.getElementById(`${id}Value`).innerText = id === 'ditherBrightness'
+        ? String(Math.round(parseFloat(e.target.value)) )
+        : parseFloat(e.target.value).toFixed(1);
       scheduleDitherPreview();
     });
   }
@@ -2522,17 +2621,7 @@ if (typeof document !== 'undefined') document.body.onload = () => {
   ensureEditorCompatibilityControls();
   paintManager = new PaintManager(canvas, ctx);
   cropManager = new CropManager(canvas, ctx, paintManager);
-  cropManager.setRenderCallback((sourceImageData, commitHistory = true) => {
-    // Every completed drag/zoom/rotation must pass through the same dither
-    // pipeline as the initial image load.
-    ctx.putImageData(sourceImageData, 0, 0);
-    ditherSourceImageData = new ImageData(
-      new Uint8ClampedArray(sourceImageData.data),
-      sourceImageData.width,
-      sourceImageData.height
-    );
-    convertDithering(commitHistory);
-  });
+  cropManager.setRenderCallback(renderTransformedImagePreview);
 
   paintManager.initPaintTools();
   cropManager.initCropTools();
@@ -2540,6 +2629,10 @@ if (typeof document !== 'undefined') document.body.onload = () => {
   document.getElementById('batteryStatus')?.addEventListener('click', () => { void refreshBatteryStatus(); });
   updateButtonStatus();
   checkDebugMode();
+  initDriverSelector();
+  if (typeof updateTgzOfficialFilterAvailability === 'function') {
+    updateTgzOfficialFilterAvailability(document.getElementById('ditherMode')?.value || 'blackWhiteColor');
+  }
   initPageBackground();
   initLayoutEditor();
 }

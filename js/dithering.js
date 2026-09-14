@@ -30,6 +30,219 @@ const blackWhitePalette = [
   { name: "白色", r: 255, g: 255, b: 255, value: 0x01 }
 ];
 
+// Readable reconstruction of the automatic four/six-color quantizer used by
+// 图公主 App 2.5.0. Palette indexes are mapped back to this project's existing
+// native transfer colors after the App-compatible error diffusion completes.
+const tgzFourIdealPalette = Object.freeze([
+  Object.freeze([0, 0, 0]),
+  Object.freeze([255, 255, 255]),
+  Object.freeze([255, 255, 0]),
+  Object.freeze([255, 0, 0])
+]);
+
+const tgzSixIdealPalette = Object.freeze([
+  ...tgzFourIdealPalette,
+  Object.freeze([0, 255, 0]),
+  Object.freeze([0, 0, 255])
+]);
+
+const tgzSixCalibratedPalette = Object.freeze([
+  Object.freeze([0, 0, 0]),
+  Object.freeze([255, 255, 255]),
+  Object.freeze([255, 235, 0]),
+  Object.freeze([154, 0, 0]),
+  Object.freeze([20, 85, 16]),
+  Object.freeze([0, 36, 154])
+]);
+
+const tgzFourTransferPalette = Object.freeze([
+  fourColorPalette[0], fourColorPalette[1], fourColorPalette[3], fourColorPalette[2]
+]);
+
+const tgzSixTransferPalette = Object.freeze([
+  rgbPalette[4], rgbPalette[5], rgbPalette[0],
+  rgbPalette[3], rgbPalette[1], rgbPalette[2]
+]);
+
+// FilterRegistry.ditherFunctions in the official App does not send every
+// filter through the generic four/six-color quantizer. These filters use a
+// restricted ink palette after their visual filter stage.
+const tgzOfficialFilterPaletteIndexes = Object.freeze({
+  pencil: Object.freeze([0, 1]),
+  grayscale: Object.freeze([0, 1]),
+  highContrastBW: Object.freeze([0, 1]),
+  crushBW: Object.freeze([0, 1]),
+  filmNoir: Object.freeze([0, 1]),
+  redWhite: Object.freeze([3, 1]),
+  blackYellow: Object.freeze([0, 2]),
+  redTriTone: Object.freeze([0, 3, 1]),
+  yellowTriTone: Object.freeze([0, 2, 1]),
+  pureRedBlack: Object.freeze([3, 0]),
+  pureYellowBlack: Object.freeze([2, 0]),
+  pureBlackWhite: Object.freeze([0, 1])
+});
+
+function tgzClampByte(value) {
+  return value < 0 ? 0 : value > 255 ? 255 : value;
+}
+
+function tgzRgbToLab(r, g, b) {
+  const linear = (value) => {
+    const normalized = value / 255;
+    return normalized > 0.04045
+      ? Math.pow((normalized + 0.055) / 1.055, 2.4)
+      : normalized / 12.92;
+  };
+  const red = linear(r);
+  const green = linear(g);
+  const blue = linear(b);
+  const x = (red * 0.4124564 + green * 0.3575761 + blue * 0.1804375) * 100;
+  const y = (red * 0.2126729 + green * 0.7151522 + blue * 0.072175) * 100;
+  const z = (red * 0.0193339 + green * 0.119192 + blue * 0.9503041) * 100;
+  const pivot = (value) => value > 0.008856
+    ? Math.cbrt(value)
+    : 7.787 * value + 16 / 116;
+  const fx = pivot(x / 95.047);
+  const fy = pivot(y / 100);
+  const fz = pivot(z / 108.883);
+  return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
+}
+
+function tgzNearestRgb(r, g, b, palette) {
+  let bestIndex = 0;
+  let bestDistance = Infinity;
+  for (let index = 0; index < palette.length; index++) {
+    const color = palette[index];
+    const dr = r - color[0];
+    const dg = g - color[1];
+    const db = b - color[2];
+    const distance = dr * dr + dg * dg + db * db;
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
+}
+
+function getTgzSixColorLuts() {
+  const luts = typeof window !== 'undefined' ? window.TGZ_SIX_COLOR_LUTS :
+    (typeof self !== 'undefined' ? self.TGZ_SIX_COLOR_LUTS : null);
+  if (!luts || !(luts.gamutRgb instanceof Uint8Array) ||
+      !(luts.paletteIndex instanceof Uint8Array) ||
+      luts.gamutRgb.length !== 786432 || luts.paletteIndex.length !== 262144) {
+    throw new Error('TGZ 六色 LUT 未正确加载，请刷新上位机页面。');
+  }
+  return luts;
+}
+
+function createTgzSixColorChooser() {
+  const luts = getTgzSixColorLuts();
+  const paletteLab = tgzSixIdealPalette.map((color) => tgzRgbToLab(color[0], color[1], color[2]));
+  return (r, g, b) => {
+    const lab = tgzRgbToLab(r, g, b);
+    if (lab[1] < -10 || lab[2] < -35) {
+      const gamutIndex = (((r & 0xfc) << 10) | ((g & 0xfc) << 4) | (b >> 2)) * 3;
+      const correctedR = r - ((r - luts.gamutRgb[gamutIndex]) >> 2);
+      const correctedG = g - ((g - luts.gamutRgb[gamutIndex + 1]) >> 2);
+      const correctedB = b - ((b - luts.gamutRgb[gamutIndex + 2]) >> 2);
+      const index = ((correctedR >> 2) & 0x3f) << 12 |
+        ((correctedG >> 2) & 0x3f) << 6 |
+        ((correctedB >> 2) & 0x3f);
+      const selected = luts.paletteIndex[index];
+      return selected < 6 ? selected : 0;
+    }
+
+    let bestIndex = 0;
+    let bestDistance = Infinity;
+    for (let index = 0; index < paletteLab.length; index++) {
+      const target = paletteLab[index];
+      const dl = lab[0] - target[0];
+      const da = lab[1] - target[1];
+      const db = lab[2] - target[2];
+      const distance = Math.trunc(2 * dl * dl + 0.8 * da * da + db * db);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestIndex = index;
+      }
+    }
+    return bestIndex;
+  };
+}
+
+function createTgzAtkinsonRows(width) {
+  return Array.from({ length: 9 }, () => new Int32Array(width));
+}
+
+function addTgzAtkinsonError(rows, width, x, row, red, green, blue) {
+  if (x < 0 || x >= width || row < 0 || row > 2) return;
+  const offset = row * 3;
+  rows[offset][x] += red;
+  rows[offset + 1][x] += green;
+  rows[offset + 2][x] += blue;
+}
+
+function spreadTgzAtkinsonError(rows, width, x, red, green, blue) {
+  addTgzAtkinsonError(rows, width, x + 1, 0, red, green, blue);
+  addTgzAtkinsonError(rows, width, x + 2, 0, red, green, blue);
+  addTgzAtkinsonError(rows, width, x - 1, 1, red, green, blue);
+  addTgzAtkinsonError(rows, width, x, 1, red, green, blue);
+  addTgzAtkinsonError(rows, width, x + 1, 1, red, green, blue);
+  addTgzAtkinsonError(rows, width, x, 2, red, green, blue);
+}
+
+function advanceTgzAtkinsonRows(rows) {
+  rows[0] = rows[3]; rows[1] = rows[4]; rows[2] = rows[5];
+  rows[3] = rows[6]; rows[4] = rows[7]; rows[5] = rows[8];
+  rows[6] = new Int32Array(rows[0].length);
+  rows[7] = new Int32Array(rows[0].length);
+  rows[8] = new Int32Array(rows[0].length);
+}
+
+function tgzAutoDither(imageData, mode, filterId = 'none') {
+  const width = imageData.width;
+  const height = imageData.height;
+  const data = imageData.data;
+  const rows = createTgzAtkinsonRows(width);
+  const sixColor = mode === 'sixColor';
+  const restrictedIndexes = tgzOfficialFilterPaletteIndexes[filterId];
+  const idealPalette = restrictedIndexes
+    ? restrictedIndexes.map(index => tgzFourIdealPalette[index])
+    : (sixColor ? tgzSixIdealPalette : tgzFourIdealPalette);
+  const errorPalette = restrictedIndexes
+    ? idealPalette
+    : (sixColor ? tgzSixCalibratedPalette : tgzFourIdealPalette);
+  const transferPalette = restrictedIndexes
+    ? restrictedIndexes.map(index => tgzFourTransferPalette[index])
+    : (sixColor ? tgzSixTransferPalette : tgzFourTransferPalette);
+  const chooseColor = !restrictedIndexes && sixColor
+    ? createTgzSixColorChooser()
+    : (r, g, b) => tgzNearestRgb(r, g, b, idealPalette);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const pixel = y * width + x;
+      const offset = pixel * 4;
+      // App stores full errors, then consumes one eighth using rounded integer arithmetic.
+      const red = tgzClampByte(data[offset] + ((rows[0][x] + 4) >> 3));
+      const green = tgzClampByte(data[offset + 1] + ((rows[1][x] + 4) >> 3));
+      const blue = tgzClampByte(data[offset + 2] + ((rows[2][x] + 4) >> 3));
+      const colorIndex = chooseColor(red, green, blue);
+      const errorColor = errorPalette[colorIndex];
+      const transferColor = transferPalette[colorIndex];
+      data[offset] = transferColor.r;
+      data[offset + 1] = transferColor.g;
+      data[offset + 2] = transferColor.b;
+      spreadTgzAtkinsonError(
+        rows, width, x,
+        red - errorColor[0], green - errorColor[1], blue - errorColor[2]
+      );
+    }
+    advanceTgzAtkinsonRows(rows);
+  }
+  return imageData;
+}
+
 // ACeP display colors adapted from paperlesspaper/epdoptimize (Apache-2.0).
 // Dithering and preview use calibrated RGB. The native nibble remains the
 // Waveshare transfer contract and is applied only after quantization.
@@ -949,6 +1162,14 @@ function esp32DitherImage(
 }
 
 function ditherImage(imageData, alg, strength, mode, adjustments = {}) {
+  if (alg === 'tgzAuto') {
+    if (mode === 'fourColor' || mode === 'sixColor') {
+      applyEsp32Adjustments(imageData, adjustments);
+      return tgzAutoDither(imageData, mode, adjustments.filter);
+    }
+    // The recovered App path only defines four/six-color behavior.
+    alg = 'atkinson';
+  }
   if (alg === 'epdOptimize') {
     const sourceData = mode === 'sevenColor' ? new Uint8ClampedArray(imageData.data) : null;
     applyEsp32Adjustments(imageData, adjustments);
@@ -961,11 +1182,28 @@ function ditherImage(imageData, alg, strength, mode, adjustments = {}) {
     }
     return epdOptimizeDither(imageData, normalizeDitherStrength(strength), mode);
   }
-  const algorithmAliases = {
-    floydSteinberg: 'floyd-steinberg',
-    jarvis: 'jarvis-judice-ninke'
-  };
-  return esp32DitherImage(imageData, algorithmAliases[alg] || alg, strength, mode, adjustments);
+
+  // Keep the original V1.7 preview path for the established algorithms.
+  // The ESP32 path uses a different palette/error model and produces visibly
+  // different previews even when the same controls are selected.
+  const safeStrength = normalizeDitherStrength(strength);
+  switch (alg) {
+    case 'floydSteinberg':
+      return floydSteinbergDither(imageData, safeStrength, mode);
+    case 'atkinson':
+      return atkinsonDither(imageData, safeStrength, mode);
+    case 'bayer':
+      return bayerDither(imageData, safeStrength, mode);
+    case 'stucki':
+      return stuckiDither(imageData, safeStrength, mode);
+    case 'jarvis':
+      return jarvisDither(imageData, safeStrength, mode);
+    case 'none':
+      return imageData;
+    default:
+      return floydSteinbergDither(imageData, safeStrength, mode);
+  }
+
 }
 
 function decodeProcessedData(processedData, width, height, mode) {

@@ -1416,7 +1416,6 @@ body.custom-background .canvas-container {
     max-height: 68vh;
     border: 1px solid #9eabb7;
     background: #fff;
-    image-rendering: pixelated;
 }
 
 .canvas-tools { margin: 14px 0 0; }
