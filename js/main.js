@@ -1,4 +1,6 @@
 let bleDevice, gattServer;
+// Serialize connection attempts: disconnect callbacks and retry timers can fire together.
+let connectPromise = null;
 let epdService, epdCharacteristic;
 let otaService, otaTxCharacteristic, otaRxCharacteristic, otaControlCharacteristic;
 let otaReceiveBuffer = new Uint8Array(0);
@@ -123,6 +125,7 @@ const EpdCmd = {
   SEND_CMD: 0x03,
   SEND_DATA: 0x04,
   REFRESH: 0x05,
+  REFRESH_PARTIAL: 0x36,
   SLEEP: 0x06,
 
   SET_TIME: 0x20,
@@ -393,23 +396,37 @@ async function write(cmd, data, withResponse = true) {
   return enqueueGattWrite(async () => {
     if (characteristic !== epdCharacteristic || !gattServer || !gattServer.connected) return false;
     addLog(bytes2hex(bytes), '⇑');
-    try {
-      if (withResponse)
-        await characteristic.writeValueWithResponse(bytes);
-      else
-        await characteristic.writeValueWithoutResponse(bytes);
-    } catch (e) {
-      console.error(e);
-      if (e.message) addLog("write: " + e.message);
-      return false;
+    for (let retry = 0; retry < 8; retry++) {
+      try {
+        if (withResponse) await characteristic.writeValueWithResponse(bytes);
+        else await characteristic.writeValueWithoutResponse(bytes);
+        if (!withResponse) await delay(4);
+        return true;
+      } catch (e) {
+        const message = String(e?.message || e);
+        const busy = /already in progress|operation in progress|GATT operation/i.test(message);
+        if (!busy || retry === 7) {
+          console.error(e);
+          if (e.message) addLog("write: " + e.message);
+          return false;
+        }
+        await delay(10 + retry * 10);
+      }
     }
     return true;
   });
 }
 
 async function writeImage(data, step = 'bw') {
-  const chunkSize = document.getElementById('mtusize').value - 2;
-  const interleavedCount = document.getElementById('interleavedcount').value;
+  const configuredChunkSize = Number(document.getElementById('mtusize').value) - 2;
+  const chunkSize = Math.max(1, Math.min(242, configuredChunkSize));
+  const configuredInterval = Number(document.getElementById('interleavedcount').value);
+  /* Web Bluetooth resolves writeWithoutResponse once the browser has queued
+   * the packet, not when the peripheral has consumed it.  Large bursts (the
+   * old default was 50) overflow the GR5513 GATT TX queue and disconnect.
+   * Keep the user setting as a hint, but never allow an unsafe burst. */
+  const interleavedCount = Number.isFinite(configuredInterval)
+    ? Math.max(0, Math.min(50, Math.floor(configuredInterval))) : 0;
   let noReplyCount = interleavedCount;
   let totalRleLength = 0;
   const stepText = step === 'bw' ? '数据块' : '红色块';
@@ -436,11 +453,8 @@ async function writeImage(data, step = 'bw') {
 
     const payload = [
       rleSupport
-        ?
-        (step === 'bw' ? 0x00 : 0x01) | (i === 0 ? 0x02 : 0x00) | (useRle ? 0x04 : 0x00)
-        :
-        (step === 'bw' ? 0x0F : 0x00) | (i === 0 ? 0x00 : 0xF0)
-      ,
+        ? (step === 'bw' ? 0x00 : 0x01) | (i === 0 ? 0x02 : 0x00) | (useRle ? 0x04 : 0x00)
+        : (step === 'bw' ? 0x0F : 0x00) | (i === 0 ? 0x00 : 0xF0),
       ...chunk,
     ];
     if (noReplyCount > 0) {
@@ -455,30 +469,45 @@ async function writeImage(data, step = 'bw') {
 }
 
 async function setDriver() {
+  const driverSelect = document.getElementById('epddriver');
+  const selectedOption = driverSelect.options[driverSelect.selectedIndex];
+  const driverId = selectedOption.getAttribute('data-driver-id') || driverSelect.value;
   await write(EpdCmd.SET_PINS, document.getElementById("epdpins").value);
-  await write(EpdCmd.INIT, document.getElementById("epddriver").value);
+  await write(EpdCmd.INIT, driverId);
 }
 
 async function syncTime(mode) {
-  if (mode === 2) {
-    if (!confirm('提醒：时钟模式目前使用全刷实现，此功能目前多用于修复老化屏残影问题，不建议长期开启，是否继续？')) return;
+  if (!epdCharacteristic || !gattServer?.connected || bootloaderMode) {
+    addLog('请先连接应用固件设备后再切换显示模式');
+    return false;
   }
-  const sample = await requestTimeSample();
-  // SET_TIME carries whole seconds. Estimate write latency from a GET_TIME
-  // round trip and choose the nearest wall-clock second at device reception.
-  const timestamp = Math.round(localWallClockMs() / 1000 + (sample ? sample.rttMs / 2000 : 0));
+  const status = document.getElementById('timeCalibrationStatus');
+  if (status) status.textContent = mode === 2 ? '正在切换到时钟模式并刷新屏幕...' : '正在切换到日历模式并刷新屏幕...';
+  /* Do not block mode switching on GET_TIME.  A slow or unsupported time
+   * read previously made the button appear dead for up to three 6-second
+   * retries.  Clock measurement/calibration keeps the sampling path; a mode
+   * switch only needs the current host second and the firmware's forced redraw. */
+  const timestamp = Math.round(localWallClockMs() / 1000);
+  const driverSelect = document.getElementById('epddriver');
+  const selectedOption = driverSelect?.options[driverSelect.selectedIndex];
+  const partialClock = mode === 2 && selectedOption?.getAttribute('data-refresh-mode') === 'partial';
   const data = new Uint8Array([
     (timestamp >> 24) & 0xFF,
     (timestamp >> 16) & 0xFF,
     (timestamp >> 8) & 0xFF,
     timestamp & 0xFF,
     0,
-    mode
+    mode,
+    partialClock ? 1 : 0
   ]);
   if (await write(EpdCmd.SET_TIME, data)) {
-    addLog("时间已同步！");
+    addLog(mode === 2 ? "已切换到时钟模式，正在刷新屏幕。" : "已切换到日历模式，正在刷新屏幕。");
     addLog("屏幕刷新完成前请不要操作。");
+    if (status) status.textContent = mode === 2 ? '时钟模式已切换，屏幕刷新中...' : '日历模式已切换，屏幕刷新中...';
+    return true;
   }
+  if (status) status.textContent = '显示模式切换失败';
+  return false;
 }
 
 function localUnixSeconds() {
@@ -992,10 +1021,6 @@ async function sendcmd() {
     return;
   }
   const compact = cmdTXT.replace(/[\s-]/g, '');
-  if (compact === '12348') {
-    setAdvancedDriverOptionsVisible(true);
-    return;
-  }
   if (compact.length === 418) {
     const certificate = hex2bytes(compact);
     document.getElementById('activationCode').value = compact;
@@ -1113,9 +1138,11 @@ async function sendimg(options = {}) {
     return false;
   }
 
+  // Image transfers always use full refresh. Clock mode has its own SET_TIME flag.
+  const refreshCommand = EpdCmd.REFRESH;
   const completionOk = targetSlot != null
     ? await write(EpdCmd.SET_SLOT, encodeSlotAction(refreshAfterSave ? 3 : 2, targetSlot))
-    : await write(EpdCmd.REFRESH);
+    : await write(refreshCommand);
   if (!completionOk) {
     slotActionPending = false;
     updateButtonStatus(); renderSlotGrid();
@@ -1376,8 +1403,20 @@ function handleNotify(value, idx) {
     if (data.length > 10) epdpins.value += bytes2hex(data.slice(10, 11));
     const reportedDriver = bytes2hex(data.slice(7, 8));
     if (epddriver.querySelector(`option[value="${reportedDriver}"]`)) {
-      epddriver.value = reportedDriver;
-      addLog(`设备驱动配置: ${reportedDriver === '13' ? '2.13寸 UC8151D 横屏' : reportedDriver}`);
+      // The firmware reports the physical controller id (14).  Keep the
+      // user's explicit UC8276 partial/full choice instead of collapsing
+      // the synthetic 14-partial option back to the full-refresh option.
+      const current = epddriver.options[epddriver.selectedIndex];
+      const keepPartial = reportedDriver === '14' && current &&
+        current.value === '14-partial';
+      if (!keepPartial) epddriver.value = reportedDriver;
+      const driverNames = {
+        '13': '2.13寸 UC8151D 横屏',
+        '14': '4.2寸 UC8276 三色',
+        '15': '4.2寸 SSD1683 黑白',
+        '16': '4.2寸 SSD1683 三色',
+      };
+      addLog(`设备驱动配置: ${driverNames[reportedDriver] || reportedDriver}`);
     } else {
       addLog(`设备返回未知驱动配置: ${reportedDriver}`);
     }
@@ -1502,6 +1541,16 @@ function handleNotify(value, idx) {
 }
 
 async function connect() {
+  if (connectPromise) return connectPromise;
+  connectPromise = connectInternal();
+  try {
+    return await connectPromise;
+  } finally {
+    connectPromise = null;
+  }
+}
+
+async function connectInternal() {
   if (bleDevice == null || (gattServer != null && gattServer.connected)) return;
 
   try {
@@ -1873,15 +1922,18 @@ async function sendReliableOtaPayload(firmware, targetAddress) {
 function setAdvancedDriverOptionsVisible(visible) {
   advancedDriverOptionsVisible = Boolean(visible);
   document.querySelectorAll('#epddriver option[data-advanced-driver="true"]').forEach((option) => {
-    option.hidden = !advancedDriverOptionsVisible;
-    option.style.display = advancedDriverOptionsVisible ? '' : 'none';
+      const alwaysVisible = option.getAttribute('data-always-visible') === 'true';
+      const show = advancedDriverOptionsVisible || alwaysVisible;
+      option.hidden = !show;
+      option.style.display = show ? '' : 'none';
   });
 }
 
 function initDriverSelector() {
   const selector = document.getElementById('epddriver');
   if (!selector) return;
-  setAdvancedDriverOptionsVisible(false);
+  // Show the complete driver list in the normal UI.
+  setAdvancedDriverOptionsVisible(true);
 }
 
 async function startOtaUpgrade() {
