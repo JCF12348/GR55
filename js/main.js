@@ -40,6 +40,12 @@ let slotState = { count: 0, pageStart: 0, pageCount: 0, usedMask: 0, selected: n
 const slotPreviewCache = new Map();
 let timeSampleWaiter = null;
 let timeMeasurementBusy = false;
+let connectionEpoch = 0;
+let slotActionTimer = null;
+let imageTransferBusy = false;
+let imageTransferError = null;
+let notificationCharacteristic = null;
+let displayWaiter = null;
 let lastDeviceTimeSample = null;
 
 // Firmware stores local wall-clock fields in a timezone-neutral timestamp.
@@ -63,6 +69,11 @@ function updateTimeReadouts() {
   if (device && lastDeviceTimeSample) {
     const value = lastDeviceTimeSample.unix + ((performance.now() - lastDeviceTimeSample.receivedAt) / 1000);
     device.textContent = formatWallClockTime(value);
+    device.title = '基于最近回包估算；样本距今 ' +
+      Math.floor((performance.now() - lastDeviceTimeSample.receivedAt) / 1000) + ' 秒';
+  } else if (device) {
+    device.textContent = '--:--:--';
+    device.title = '尚无设备时间回包';
   }
 }
 
@@ -333,6 +344,18 @@ function intToHex(intIn) {
 }
 
 function resetVariables() {
+  if (displayWaiter) displayWaiter.resolve(false);
+  displayWaiter = null;
+  ++connectionEpoch;
+  if (notificationCharacteristic) notificationCharacteristic.removeEventListener('characteristicvaluechanged', onEpdNotification);
+  notificationCharacteristic = null;
+  if (timeSampleWaiter) timeSampleWaiter.resolve(null);
+  timeSampleWaiter = null;
+  lastDeviceTimeSample = null;
+  imageTransferBusy = false;
+  imageTransferError = null;
+  clearTimeout(slotActionTimer);
+  slotActionTimer = null;
   for (const resolve of activationStateWaiters) resolve(null);
   activationStateWaiters = [];
   deviceActivationState = null;
@@ -418,6 +441,8 @@ async function write(cmd, data, withResponse = true) {
 }
 
 async function writeImage(data, step = 'bw') {
+  const epoch = connectionEpoch;
+  const is213 = document.getElementById('epddriver')?.value === '13';
   const configuredChunkSize = Number(document.getElementById('mtusize').value) - 2;
   const chunkSize = Math.max(1, Math.min(242, configuredChunkSize));
   const configuredInterval = Number(document.getElementById('interleavedcount').value);
@@ -425,20 +450,25 @@ async function writeImage(data, step = 'bw') {
    * the packet, not when the peripheral has consumed it.  Large bursts (the
    * old default was 50) overflow the GR5513 GATT TX queue and disconnect.
    * Keep the user setting as a hint, but never allow an unsafe burst. */
-  const interleavedCount = Number.isFinite(configuredInterval)
-    ? Math.max(0, Math.min(50, Math.floor(configuredInterval))) : 0;
+  const interleavedCount = is213 ? 0 : (Number.isFinite(configuredInterval)
+    ? Math.max(0, Math.min(50, Math.floor(configuredInterval))) : 0);
   let noReplyCount = interleavedCount;
   let totalRleLength = 0;
   const stepText = step === 'bw' ? '数据块' : '红色块';
 
   // Use RLE only when its complete encoded stream is smaller than the
   // original data. Each RLE chunk contains complete codes.
-  const rleChunks = rleSupport ? rleCompressMTU(data, chunkSize) : null;
+  // UC8151D's two-plane accumulator expects every raw byte in order. Keep
+  // its legacy confirmed raw path; the fast RLE path remains for 4.2 and
+  // other controllers.
+  const rleChunks = !is213 && rleSupport ? rleCompressMTU(data, chunkSize) : null;
   const rleLength = rleChunks ? rleChunks.reduce((total, chunk) => total + chunk.length, 0) : data.length;
   const useRle = rleSupport && rleLength < data.length;
   const totalChunks = useRle ? rleChunks.length : Math.ceil(data.length / chunkSize);
 
   for (let i = 0; i < totalChunks; i++) {
+    if (epoch !== connectionEpoch) return false;
+    if (imageTransferError) return false;
     let chunk;
     if (useRle) {
       chunk = rleChunks[i];
@@ -477,11 +507,13 @@ async function setDriver() {
 }
 
 async function syncTime(mode) {
+  if (timeMeasurementBusy || imageTransferBusy || otaBusy) return false;
   if (!epdCharacteristic || !gattServer?.connected || bootloaderMode) {
     addLog('请先连接应用固件设备后再切换显示模式');
     return false;
   }
   const status = document.getElementById('timeCalibrationStatus');
+  timeMeasurementBusy = true;
   if (status) status.textContent = mode === 2 ? '正在切换到时钟模式并刷新屏幕...' : '正在切换到日历模式并刷新屏幕...';
   /* Do not block mode switching on GET_TIME.  A slow or unsupported time
    * read previously made the button appear dead for up to three 6-second
@@ -500,7 +532,11 @@ async function syncTime(mode) {
     mode,
     partialClock ? 1 : 0
   ]);
+  try {
   if (await write(EpdCmd.SET_TIME, data)) {
+    await delay(300);
+    const verify = await requestTimeSample();
+    if (verify) addLog(`设备时间回读确认：误差 ${verify.errorMs >= 0 ? '+' : ''}${verify.errorMs.toFixed(0)} ms`);
     addLog(mode === 2 ? "已切换到时钟模式，正在刷新屏幕。" : "已切换到日历模式，正在刷新屏幕。");
     addLog("屏幕刷新完成前请不要操作。");
     if (status) status.textContent = mode === 2 ? '时钟模式已切换，屏幕刷新中...' : '日历模式已切换，屏幕刷新中...';
@@ -508,6 +544,9 @@ async function syncTime(mode) {
   }
   if (status) status.textContent = '显示模式切换失败';
   return false;
+  } finally {
+    timeMeasurementBusy = false;
+  }
 }
 
 function localUnixSeconds() {
@@ -539,39 +578,46 @@ function waitForTimeSample(timeoutMs = 6000) {
 
 async function requestTimeSample() {
   if (!epdCharacteristic || !gattServer?.connected || bootloaderMode) return null;
+  const epoch = connectionEpoch;
   let sample = null;
   let sentAt = 0;
+  let sentWall = 0;
   for (let attempt = 0; attempt < 3 && !sample; attempt++) {
     const wait = waitForTimeSample(6000);
     sentAt = performance.now();
+    sentWall = localWallClockMs();
     // The firmware handles GET_TIME as a notification-triggering command;
     // keep this as a write without response. Confirmed writes can be held by
     // the peripheral while a display refresh is active and produce no t= reply.
     if (!await write(EpdCmd.GET_TIME, new Uint8Array(0), false)) {
+      if (timeSampleWaiter) timeSampleWaiter.resolve(null);
       timeSampleWaiter = null;
       return null;
     }
     sample = await wait;
+    if (epoch !== connectionEpoch) return null;
     if (!sample && attempt < 2) await delay(250);
   }
   if (!sample) return null;
   const receivedAt = sample.receivedAt;
   // Compare against the local wall-clock representation used by firmware.
-  const midpoint = (localWallClockMs() / 1000) + (receivedAt - sentAt) / 2000;
+  const midpoint = sentWall / 1000 + (receivedAt - sentAt) / 2000;
   // The firmware exposes whole seconds. Treat the reported second as the
   // center of its one-second interval so truncation is not reported as drift.
   return { ...sample, errorMs: (sample.unix + 0.5 - midpoint) * 1000, rttMs: receivedAt - sentAt };
 }
 
 async function measureDeviceClock() {
-  if (timeMeasurementBusy) return;
+  if (timeMeasurementBusy || imageTransferBusy || otaBusy) return;
   timeMeasurementBusy = true;
+  const epoch = connectionEpoch;
   const status = document.getElementById('timeCalibrationStatus');
   if (status) status.textContent = '正在采样设备时钟...';
   const samples = [];
   try {
     for (let i = 0; i < 8; i++) {
       const sample = await requestTimeSample();
+      if (epoch !== connectionEpoch) return;
       if (sample) samples.push(sample);
       if (i < 7) await new Promise(resolve => setTimeout(resolve, 180));
     }
@@ -589,24 +635,21 @@ async function measureDeviceClock() {
 }
 
 async function calibrateDeviceTime() {
+  if (timeMeasurementBusy || imageTransferBusy || otaBusy) return;
   if (!epdCharacteristic || !gattServer?.connected || bootloaderMode) {
     addLog('请先连接应用固件设备后再校准时间');
     return;
   }
   const status = document.getElementById('timeCalibrationStatus');
   const started = performance.now();
+  const epoch = connectionEpoch;
+  timeMeasurementBusy = true;
+  try {
   if (status) status.textContent = '正在校准设备时间...';
   const before = await requestTimeSample();
-  if (status) status.textContent = '正在读取设备时间（约 6 秒）...';
-  // Crystal compensation is intentionally neutral; a short read window is
-  // sufficient for the manual/current-time correction.
-  await new Promise(resolve => setTimeout(resolve, 6000));
-  const driftSample = await requestTimeSample();
-  const elapsed = before && driftSample ? Math.max(1, (driftSample.receivedAt - before.receivedAt) / 1000) : 0;
-  // GET_TIME has one-second resolution; endpoint differences are dominated by
-  // quantization and cannot yield a trustworthy crystal slope. Keep the
-  // persistent compensation neutral and correct the wall-clock instant only.
-  const ppm = 0;
+  if (epoch !== connectionEpoch) return;
+  const driftSample = before;
+  const ppm = appVersion >= 0x35 ? -2147483648 : 0;
   const view = new DataView(new ArrayBuffer(4)); view.setInt32(0, ppm);
   const calibratedTarget = Math.round(localWallClockMs() / 1000 + (driftSample ? driftSample.rttMs / 2000 : 0));
   const data = new Uint8Array([ (calibratedTarget >> 24) & 0xFF, (calibratedTarget >> 16) & 0xFF, (calibratedTarget >> 8) & 0xFF, calibratedTarget & 0xFF, 0, 1, view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3) ]);
@@ -616,14 +659,20 @@ async function calibrateDeviceTime() {
   }
   await new Promise(resolve => setTimeout(resolve, 250));
   const after = await requestTimeSample();
+  if (epoch !== connectionEpoch) return;
   if (!after) { if (status) status.textContent = '已发送校准，等待设备返回超时'; return; }
   const beforeText = before ? `${before.errorMs >= 0 ? '+' : ''}${before.errorMs.toFixed(0)} ms` : '未读取';
   const afterText = `${after.errorMs >= 0 ? '+' : ''}${after.errorMs.toFixed(0)} ms`;
-  if (status) status.textContent = `已校准 · 频率补偿 ${ppm >= 0 ? '+' : ''}${ppm} ppm · 当前 ${afterText}`;
-  addLog(`时间校准完成：校准前 ${beforeText}，当前 ${afterText}，晶振补偿 ${ppm >= 0 ? '+' : ''}${ppm} ppm，耗时 ${((performance.now() - started) / 1000).toFixed(2)} s`);
+  const trimText = appVersion >= 0x35 ? '保留频率补偿' : '旧固件频率补偿归零';
+  if (status) status.textContent = `时间已同步 · ${trimText} · 秒级采样估计 ${afterText}`;
+  addLog(`时间同步：校准前 ${beforeText}，当前估计 ${afterText}，${trimText}，耗时 ${((performance.now() - started) / 1000).toFixed(2)} s`);
+  } catch (error) {
+    if (status) status.textContent = '时间同步失败：' + error.message;
+  } finally { timeMeasurementBusy = false; }
 }
 
 async function applyManualTimeOffset() {
+  if (timeMeasurementBusy || imageTransferBusy || otaBusy) return;
   if (!epdCharacteristic || !gattServer?.connected || bootloaderMode) {
     addLog('请先连接应用固件设备后再应用手动时间补偿');
     return;
@@ -637,17 +686,20 @@ async function applyManualTimeOffset() {
     return;
   }
   if (button) button.disabled = true;
+  timeMeasurementBusy = true;
+  const epoch = connectionEpoch;
   if (status) status.textContent = `正在应用 ${offset >= 0 ? '+' : ''}${offset} 秒补偿...`;
   try {
     const target = Math.round(localWallClockMs() / 1000) + offset;
     const data = new Uint8Array([
       (target >> 24) & 0xFF, (target >> 16) & 0xFF,
       (target >> 8) & 0xFF, target & 0xFF,
-      0, 1, 0, 0, 0, 0,
+      0, 1, appVersion >= 0x35 ? 0x80 : 0, 0, 0, 0,
     ]);
     if (!await write(EpdCmd.SET_TIME, data, true)) throw new Error('设备未确认时间写入');
     await delay(250);
-    const sample = await requestTimeSample();
+      const sample = await requestTimeSample();
+      if (epoch !== connectionEpoch) return;
     const measured = sample ? sample.errorMs.toFixed(0) : '未读取';
     if (status) status.textContent = `手动补偿已应用 ${offset >= 0 ? '+' : ''}${offset} 秒 · 当前误差 ${measured} ms`;
     addLog(`手动时间补偿已应用：${offset >= 0 ? '+' : ''}${offset} 秒，当前误差 ${measured} ms`);
@@ -655,6 +707,7 @@ async function applyManualTimeOffset() {
     if (status) status.textContent = `手动补偿失败：${error.message}`;
     addLog(`手动时间补偿失败：${error.message}`);
   } finally {
+    timeMeasurementBusy = false;
     if (button) button.disabled = false;
   }
 }
@@ -865,9 +918,13 @@ function waitForSlotReady(slot) {
 
 async function prepareImageSlot(slot) {
   const ready = waitForSlotReady(slot);
+  const waiter = slotPrepareWait;
   if (!await write(EpdCmd.SET_SLOT, encodeSlotAction(0, slot))) {
-    clearTimeout(slotPrepareWait.timer);
-    slotPrepareWait = null;
+    if (waiter && slotPrepareWait === waiter) {
+      clearTimeout(waiter.timer);
+      slotPrepareWait = null;
+      waiter.resolve(false);
+    }
     return false;
   }
   return ready;
@@ -883,7 +940,19 @@ async function saveImageToSlot(slot) {
   return sendimg({ slot, refreshAfterSave: document.getElementById('slotRefreshAfterSave').checked });
 }
 
+function armSlotActionTimeout() {
+  clearTimeout(slotActionTimer);
+  const epoch = connectionEpoch;
+  slotActionTimer = setTimeout(() => {
+    if (epoch !== connectionEpoch || !slotActionPending) return;
+    slotActionPending = false;
+    document.getElementById('slotReadStatus').textContent = '槽位操作等待超时，请读取槽位确认结果';
+    updateButtonStatus(); renderSlotGrid();
+  }, 180000);
+}
+
 async function displayImageSlot(slot) {
+  armSlotActionTimeout();
   slotActionPending = true; updateButtonStatus(); renderSlotGrid();
   const ok = await write(EpdCmd.SET_SLOT, encodeSlotAction(1, slot));
   if (!ok) { slotActionPending = false; updateButtonStatus(); renderSlotGrid(); }
@@ -891,6 +960,7 @@ async function displayImageSlot(slot) {
 }
 
 async function freeImageSlot(slot) {
+  armSlotActionTimeout();
   if (!confirm(`确认删除槽位 ${slot + 1}？`)) return false;
   slotActionPending = true; updateButtonStatus(); renderSlotGrid();
   const ok = await write(EpdCmd.FREE_SLOT, encodeSlotIndex(slot));
@@ -899,6 +969,7 @@ async function freeImageSlot(slot) {
 }
 
 async function freeAllImageSlots() {
+  armSlotActionTimeout();
   if (!confirm('确认擦除全部图片槽位？此操作不可恢复。')) return false;
   slotActionPending = true; updateButtonStatus(); renderSlotGrid();
   document.getElementById('slotReadStatus').textContent = '正在擦除全部槽位，请勿断开连接...';
@@ -922,13 +993,20 @@ async function readImageSlot(slot) {
   slotReadState = { slot, pendingInfo: true, retries: 0 };
   document.getElementById('slotReadStatus').textContent = `正在读取槽位 ${slot + 1}...`;
   updateButtonStatus(); renderSlotGrid();
-  return write(EpdCmd.GET_IMAGE, encodeSlotIndex(slot), false);
+  armSlotReadTimeout();
+  const ok = await write(EpdCmd.GET_IMAGE, encodeSlotIndex(slot), false);
+  if (!ok) finishSlotRead(false, '槽位读取请求失败');
+  return ok;
 }
 
 function armSlotReadTimeout() {
   if (slotReadTimer) clearTimeout(slotReadTimer);
   slotReadTimer = setTimeout(() => {
     if (!slotReadState) return;
+    if (slotReadState.pendingInfo) {
+      finishSlotRead(false, '槽位元信息读取超时');
+      return;
+    }
     if (slotReadState.retries++ < SLOT_READ_MAX_RETRIES && !slotReadState.streaming) {
       const index = Math.floor(slotReadState.received / slotReadState.chunkSize);
       requestSlotChunk(index);
@@ -950,7 +1028,16 @@ async function requestSlotChunk(index) {
 function beginSlotRead(message) {
   const meta = parseImageMetadata(message);
   if (!meta || !slotReadState || meta.slot !== slotReadState.slot || meta.size <= 0 || meta.size > 1024 * 1024) return false;
+  if (!Number.isSafeInteger(meta.width) || !Number.isSafeInteger(meta.height) ||
+      meta.width < 1 || meta.height < 1 || meta.width > 2048 || meta.height > 2048 ||
+      meta.chunkSize < 1 || meta.chunkSize > 4096 || ![1, 2, 3].includes(meta.color)) {
+    finishSlotRead(false, '槽位元信息异常'); return false;
+  }
+  const expectedSize = meta.color === 3 ? Math.ceil(meta.width * meta.height / 4)
+    : Math.ceil(meta.width / 8) * meta.height * (meta.color === 2 ? 2 : 1);
+  if (meta.size !== expectedSize) { finishSlotRead(false, '槽位尺寸与数据长度不一致'); return false; }
   slotReadState = { ...meta, data: new Uint8Array(meta.size), received: 0, expected: null,
+    fingerprint: slotState.fingerprints[meta.slot - slotState.pageStart],
     retries: 0, streaming: slotStreamSupport };
   armSlotReadTimeout();
   if (slotStreamSupport) {
@@ -965,6 +1052,13 @@ function beginSlotChunk(message) {
   if (!slotReadState || slotReadState.pendingInfo) return false;
   const match = /^chunk=(\d+)\s+len=(\d+)\s+rle=0$/.exec(message.trim());
   if (!match) return false;
+  const index = Number(match[1]), length = Number(match[2]);
+  if (!Number.isSafeInteger(index) || slotReadState.chunkSize <= 0 ||
+      index * slotReadState.chunkSize !== slotReadState.received ||
+      length !== Math.min(slotReadState.chunkSize, slotReadState.size - slotReadState.received)) {
+    finishSlotRead(false, '槽位数据块顺序或长度异常');
+    return false;
+  }
   slotReadState.expected = { index: Number(match[1]), length: Number(match[2]), parts: [], received: 0 };
   armSlotReadTimeout();
   return true;
@@ -990,6 +1084,15 @@ function receiveSlotChunk(data) {
   return true;
 }
 
+function slotFrameCrc(data) {
+  let crc = 0xFFFFFFFF;
+  for (const byte of data) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
+  }
+  return ((crc ^ 0xFFFFFFFF) >>> 0).toString(16).padStart(8, '0');
+}
+
 function finishSlotRead(success, message = '') {
   if (slotReadTimer) clearTimeout(slotReadTimer);
   slotReadTimer = null;
@@ -997,6 +1100,8 @@ function finishSlotRead(success, message = '') {
   slotReadState = null;
   if (success && state) {
     try {
+      if (state.fingerprint && state.fingerprint !== '00000000' &&
+          slotFrameCrc(state.data) !== state.fingerprint.toLowerCase()) throw new Error('整图CRC校验失败');
       const mode = state.color === 2 ? 'threeColor' : state.color === 3 ? 'fourColor' : 'blackWhiteColor';
       const previewCanvas = document.createElement('canvas');
       previewCanvas.width = state.width; previewCanvas.height = state.height;
@@ -1063,6 +1168,11 @@ function convertUC8159(blackWhiteData, redWhiteData) {
 }
 
 async function sendimg(options = {}) {
+  if (imageTransferBusy || timeMeasurementBusy || otaBusy) return false;
+  imageTransferBusy = true;
+  imageTransferError = null;
+  const epoch = connectionEpoch;
+  try {
   // The current crop manager keeps transforms pending instead of exposing the
   // old isCropMode/finishCrop API. Commit any last pan/zoom before encoding.
   if (cropManager && cropManager.commitPendingTransform) cropManager.commitPendingTransform(true);
@@ -1090,8 +1200,11 @@ async function sendimg(options = {}) {
 
   updateButtonStatus(true);
 
-  if (!await write(EpdCmd.INIT)) { updateButtonStatus(); return false; }
+  const modelId = parseInt(selectedOption.getAttribute('data-driver-id') || epdDriverSelect.value, 16);
+  const transferInit = appVersion >= 0x35 ? Uint8Array.of(modelId, 1) : undefined;
+  if (!await write(EpdCmd.INIT, transferInit)) { updateButtonStatus(); return false; }
   if (targetSlot != null) {
+    armSlotActionTimeout();
     slotActionPending = true;
     if (!await prepareImageSlot(targetSlot)) {
       slotActionPending = false;
@@ -1113,7 +1226,7 @@ async function sendimg(options = {}) {
       transferOk = await writeImage(convertUC8159(blackWhiteData, redWhiteData), 'bw');
     } else {
       transferOk = await writeImage(blackWhiteData, 'bw');
-      if (transferOk) transferOk = await writeImage(redWhiteData, 'red');
+      if (transferOk && epoch === connectionEpoch) transferOk = await writeImage(redWhiteData, 'red');
     }
   } else if (ditherMode === 'blackWhiteColor') {
     if (['08', '09', '0e', '0f'].includes(epdDriverSelect.value)) {
@@ -1130,24 +1243,33 @@ async function sendimg(options = {}) {
     return false;
   }
 
-  if (!transferOk) {
+  if (!transferOk || epoch !== connectionEpoch) {
     if (targetSlot != null) await write(EpdCmd.SET_SLOT, encodeSlotAction(0, 0xFFFFFFFF));
     slotActionPending = false;
     updateButtonStatus(); renderSlotGrid();
     setStatus('图片发送失败。');
+    // A failed 2.13 transfer can leave the peripheral in an unfinished
+    // image transaction. Force a clean GATT session so the next attempt does
+    // not inherit stale RAM/slot state.
+    if (epoch === connectionEpoch && document.getElementById('epddriver')?.value === '13')
+      bleDevice?.gatt?.disconnect();
     return false;
   }
 
   // Image transfers always use full refresh. Clock mode has its own SET_TIME flag.
   const refreshCommand = EpdCmd.REFRESH;
+  const displayed = targetSlot == null && appVersion >= 0x35 ? waitForDisplay() : null;
   const completionOk = targetSlot != null
     ? await write(EpdCmd.SET_SLOT, encodeSlotAction(refreshAfterSave ? 3 : 2, targetSlot))
     : await write(refreshCommand);
   if (!completionOk) {
+    if (displayWaiter) displayWaiter.resolve(false);
+    displayWaiter = null;
     slotActionPending = false;
     updateButtonStatus(); renderSlotGrid();
     return false;
   }
+  if (displayed && !await displayed) throw new Error('设备未确认屏幕刷新成功');
   updateButtonStatus();
 
   const sendTime = (new Date().getTime() - startTime) / 1000.0;
@@ -1158,6 +1280,18 @@ async function sendimg(options = {}) {
     status.parentElement.style.display = "none";
   }, 5000);
   return true;
+  } catch (error) {
+    if (epoch === connectionEpoch && gattServer?.connected) {
+      await write(EpdCmd.SET_SLOT, encodeSlotAction(0, 0xFFFFFFFF));
+      if (document.getElementById('epddriver')?.value === '13') bleDevice?.gatt?.disconnect();
+    }
+    slotActionPending = false;
+    setStatus('发送失败：' + (error.message || error));
+    return false;
+  } finally {
+    imageTransferBusy = false;
+    updateButtonStatus(); renderSlotGrid();
+  }
 }
 
 function downloadDataArray() {
@@ -1203,6 +1337,7 @@ function downloadDataArray() {
 }
 
 function updateButtonStatus(forceDisabled = false) {
+  forceDisabled = forceDisabled || imageTransferBusy || timeMeasurementBusy || slotReadState != null;
   const connected = gattServer != null && gattServer.connected;
   const epdReady = connected && epdCharacteristic && !forceDisabled && !otaBusy;
   document.getElementById("connectbutton").disabled = otaBusy;
@@ -1312,7 +1447,7 @@ async function confirmOtaAfterReset(attempt) {
       otaVerificationPending = false;
       if (otaExpectedActivationState === null || current === otaExpectedActivationState) {
         const stateText = current ? '已激活' : '未激活';
-        setOtaStatus(`OTA 升级完成，设备${stateText}状态已保留`, 'success');
+        setOtaStatus(`设备已重连，${stateText}状态已保留；目标固件版本仍需确认`);
         addLog(`OTA 后校验通过：设备仍为${stateText}`);
       } else {
         setOtaStatus('OTA 后激活状态与升级前不一致，请停止操作并检查 NVDS', 'error');
@@ -1424,13 +1559,19 @@ function handleNotify(value, idx) {
   } else {
     if (textDecoder == null) textDecoder = new TextDecoder();
     const msg = textDecoder.decode(data);
+    if (displayWaiter && (msg === 'display=done' ||
+        (msg.startsWith('display=') && msg.includes('error')) || msg === 'slot=busy')) {
+      const waiter = displayWaiter;
+      displayWaiter = null;
+      waiter.resolve(msg === 'display=done');
+    }
     const logMessage = msg.startsWith('activation=')
       ? (msg.startsWith('activation=1') ? '设备已激活' : '设备未激活')
       : msg;
     addLog(logMessage, '⇓');
     if (msg === 'slot_v2=1 slot_stream=1') {
       slotStreamSupport = true;
-      void refreshSlots(0);
+      if (!imageTransferBusy) void refreshSlots(0);
     } else if (msg.startsWith('slots=')) {
       const parsed = parseSlotsMessage(msg);
       if (parsed) {
@@ -1452,8 +1593,15 @@ function handleNotify(value, idx) {
       slotActionPending = false;
       updateButtonStatus(); renderSlotGrid();
       void refreshSlots();
-    } else if (msg.startsWith('slot=') && msg.includes('error')) {
+    } else if ((msg.startsWith('slot=') && (msg.includes('error') ||
+      msg === 'slot=busy' || msg === 'slot=unavailable')) || msg === 'img=invalid' ||
+      (msg.startsWith('display=') && msg.includes('error'))) {
+      if (imageTransferBusy && msg !== 'slot=unavailable') imageTransferError = msg;
       slotActionPending = false;
+      clearTimeout(slotActionTimer);
+      if (slotReadState) finishSlotRead(false, msg);
+      document.getElementById('slotReadStatus').textContent = msg === 'slot=unavailable'
+        ? '图片存储不可用或格式不兼容；清空槽位将重新格式化（会删除图片）' : '设备操作失败：' + msg;
       if (slotPrepareWait) {
         clearTimeout(slotPrepareWait.timer);
         const resolve = slotPrepareWait.resolve;
@@ -1550,6 +1698,23 @@ async function connect() {
   }
 }
 
+function waitForDisplay() {
+  if (displayWaiter) return Promise.resolve(false);
+  return new Promise(resolve => {
+    const timer = setTimeout(() => {
+      if (displayWaiter === waiter) displayWaiter = null;
+      resolve(false);
+    }, 90000);
+    const waiter = { resolve: value => { clearTimeout(timer); resolve(value); } };
+    displayWaiter = waiter;
+  });
+}
+
+function onEpdNotification(event) {
+  if (event.target !== notificationCharacteristic) return;
+  handleNotify(event.target.value, msgIndex++);
+}
+
 async function connectInternal() {
   if (bleDevice == null || (gattServer != null && gattServer.connected)) return;
 
@@ -1587,20 +1752,10 @@ async function connectInternal() {
       appVersion = 0x15;
     }
 
-    if (appVersion < 0x16) {
-      const oldURL = "https://tsl0922.github.io/EPD-nRF5/v1.5";
-      alert("!!!注意!!!\n当前固件版本过低，可能无法正常使用部分功能，建议升级到最新版本。");
-      if (confirm('是否访问旧版本上位机？')) location.href = oldURL;
-      setTimeout(() => {
-        addLog(`如遇到问题，可访问旧版本上位机: ${oldURL}`);
-      }, 500);
-    }
-
     try {
+      notificationCharacteristic = epdCharacteristic;
+      notificationCharacteristic.addEventListener('characteristicvaluechanged', onEpdNotification);
       await epdCharacteristic.startNotifications();
-      epdCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
-        handleNotify(event.target.value, msgIndex++);
-      });
     } catch (e) {
       console.error(e);
       if (e.message) addLog("startNotifications: " + e.message);
@@ -1638,6 +1793,10 @@ async function connectInternal() {
   if (!bootloaderMode) {
     await write(EpdCmd.INIT);
     await write(EpdCmd.GET_STATUS);
+    // Treat every normal connection as a time-sync handshake.  The flag is
+    // consumed only by an activation=1 response, so locked devices are not
+    // sent time writes before activation.
+    activationReconnectSyncPending = true;
     await queryActivation();
     setTimeout(() => {
       if (gattServer && gattServer.connected && epdCharacteristic && !otaBusy) void write(EpdCmd.GET_STATUS);
@@ -1937,6 +2096,7 @@ function initDriverSelector() {
 }
 
 async function startOtaUpgrade() {
+  if (otaBusy || imageTransferBusy || timeMeasurementBusy || slotReadState || slotActionPending) return;
   if (!otaSelectedPackage || !otaRxCharacteristic || !otaControlCharacteristic) return;
   if (!bootloaderMode && lastBatteryStatus && lastBatteryStatus.voltage < 2700) {
     setOtaStatus('电压低于 2.70V，已禁止 OTA 升级', 'error');
@@ -2058,7 +2218,7 @@ async function startOtaUpgrade() {
 }
 
 function setStatus(statusText) {
-  document.getElementById("status").innerHTML = statusText;
+  document.getElementById("status").textContent = statusText;
 }
 
 function addLog(logTXT, action = '') {
