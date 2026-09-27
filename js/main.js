@@ -13,6 +13,7 @@ let otaCompletedAwaitingRestart = false;
 let otaTransferStats = null;
 let otaExpectedActivationState = null;
 let otaVerificationPending = false;
+let otaEnteringBootloader = false;
 let deviceActivationState = null;
 let activationStateWaiters = [];
 let bootloaderMode = false;
@@ -42,11 +43,16 @@ let timeSampleWaiter = null;
 let timeMeasurementBusy = false;
 let connectionEpoch = 0;
 let slotActionTimer = null;
+let slotRefreshRetryTimer = null;
+let slotRefreshRetryAttempted = false;
+let slotRefreshPendingAfterDisplay = false;
 let imageTransferBusy = false;
 let imageTransferError = null;
 let notificationCharacteristic = null;
 let displayWaiter = null;
 let lastDeviceTimeSample = null;
+let deviceDisplayMode = 1;
+const HOST_BUILD_ID = '20260925-bootloader-fast-ota-v2';
 
 // Firmware stores local wall-clock fields in a timezone-neutral timestamp.
 function localWallClockMs(date = new Date()) {
@@ -116,6 +122,11 @@ const OTA_TAIL_SIZE = 48;
 const OTA_CHUNK_SIZE = 226;
 // Fast DFU sends raw ATT payloads after erase; MTU 244 leaves 241 bytes.
 const OTA_FAST_CHUNK_SIZE = 241;
+// The bootloader drains its 5 KiB ring buffer in 1 KiB Flash writes. Browser
+// write-without-response completion only means the OS accepted the packet, so
+// keep bursts below 1 KiB and leave the peripheral time to drain each burst.
+const OTA_FAST_BURST_PACKETS = 4;
+const OTA_FAST_BURST_PAUSE_MS = 25;
 const OTA_MAX_RESPONSE_PAYLOAD = 512;
 const OTA_ACTIVATION_MARKERS = ['locked=activation_required', 'activation=already'];
 
@@ -382,11 +393,16 @@ function resetVariables() {
   otaBusy = false;
   otaFinalizing = false;
   otaCompletedAwaitingRestart = false;
+  otaEnteringBootloader = false;
   bootloaderMode = false;
   msgIndex = 0;
   rleSupport = false;
   slotStreamSupport = false;
   slotActionPending = false;
+  if (slotRefreshRetryTimer) clearTimeout(slotRefreshRetryTimer);
+  slotRefreshRetryTimer = null;
+  slotRefreshRetryAttempted = false;
+  slotRefreshPendingAfterDisplay = false;
   if (slotPrepareWait) {
     clearTimeout(slotPrepareWait.timer);
     slotPrepareWait.resolve(false);
@@ -418,7 +434,9 @@ async function write(cmd, data, withResponse = true) {
   const bytes = Uint8Array.from(payload);
   return enqueueGattWrite(async () => {
     if (characteristic !== epdCharacteristic || !gattServer || !gattServer.connected) return false;
-    addLog(bytes2hex(bytes), '⇑');
+    // Image payloads can contain hundreds of bytes per packet. Logging their
+    // full hexadecimal bodies floods the textarea and slows down transfers.
+    if (cmd !== EpdCmd.WRITE_IMG) addLog(bytes2hex(bytes), '⇑');
     for (let retry = 0; retry < 8; retry++) {
       try {
         if (withResponse) await characteristic.writeValueWithResponse(bytes);
@@ -440,7 +458,44 @@ async function write(cmd, data, withResponse = true) {
   });
 }
 
-async function writeImage(data, step = 'bw') {
+function buildTimePayload(timestamp, {
+  mode = 1,
+  preserveMode = false,
+  ppm = -2147483648,
+  partial = false,
+} = {}) {
+  const seconds = Math.round(Number(timestamp)) >>> 0;
+  const payload = [
+    (seconds >>> 24) & 0xFF,
+    (seconds >>> 16) & 0xFF,
+    (seconds >>> 8) & 0xFF,
+    seconds & 0xFF,
+    0,
+    mode,
+  ];
+  if (preserveMode) {
+    const trim = new DataView(new ArrayBuffer(4));
+    trim.setInt32(0, ppm);
+    payload.push(trim.getUint8(0), trim.getUint8(1), trim.getUint8(2), trim.getUint8(3));
+  } else {
+    payload.push(partial ? 1 : 0);
+  }
+  return Uint8Array.from(payload);
+}
+
+function imageTransferProgress(completedBytes, totalBytes, startedAt, now = performance.now()) {
+  const elapsedSeconds = Math.max(0.001, (now - startedAt) / 1000);
+  const percent = totalBytes > 0 ? Math.min(100, Math.round(completedBytes * 100 / totalBytes)) : 100;
+  const speedKiB = completedBytes / 1024 / elapsedSeconds;
+  return {
+    percent,
+    speedKiB,
+    elapsedSeconds,
+    text: `${percent}% · ${speedKiB.toFixed(1)} KiB/s · 已用 ${elapsedSeconds.toFixed(1)} 秒`,
+  };
+}
+
+async function writeImage(data, step = 'bw', transferStats = null) {
   const epoch = connectionEpoch;
   const is213 = document.getElementById('epddriver')?.value === '13';
   const configuredChunkSize = Number(document.getElementById('mtusize').value) - 2;
@@ -465,6 +520,7 @@ async function writeImage(data, step = 'bw') {
   const rleLength = rleChunks ? rleChunks.reduce((total, chunk) => total + chunk.length, 0) : data.length;
   const useRle = rleSupport && rleLength < data.length;
   const totalChunks = useRle ? rleChunks.length : Math.ceil(data.length / chunkSize);
+  let phaseBytes = 0;
 
   for (let i = 0; i < totalChunks; i++) {
     if (epoch !== connectionEpoch) return false;
@@ -477,9 +533,6 @@ async function writeImage(data, step = 'bw') {
       const off = i * chunkSize;
       chunk = data.slice(off, off + chunkSize);
     }
-
-    const currentTime = (new Date().getTime() - startTime) / 1000.0;
-    setStatus(`${stepText}: ${i + 1}/${totalChunks}, 总用时: ${currentTime}s`);
 
     const payload = [
       rleSupport
@@ -494,6 +547,10 @@ async function writeImage(data, step = 'bw') {
       if (!await write(EpdCmd.WRITE_IMG, payload, true)) return false;
       noReplyCount = interleavedCount;
     }
+    phaseBytes += chunk.length;
+    if (transferStats) transferStats.sentBytes += chunk.length;
+    const progress = imageTransferProgress(phaseBytes, rleLength, transferStats?.startedAt ?? performance.now());
+    setStatus(`${stepText}：${progress.text}`);
   }
   return true;
 }
@@ -519,25 +576,19 @@ async function syncTime(mode) {
    * read previously made the button appear dead for up to three 6-second
    * retries.  Clock measurement/calibration keeps the sampling path; a mode
    * switch only needs the current host second and the firmware's forced redraw. */
-  const timestamp = Math.round(localWallClockMs() / 1000);
   const driverSelect = document.getElementById('epddriver');
   const selectedOption = driverSelect?.options[driverSelect.selectedIndex];
   const partialClock = mode === 2 && selectedOption?.getAttribute('data-refresh-mode') === 'partial';
-  const data = new Uint8Array([
-    (timestamp >> 24) & 0xFF,
-    (timestamp >> 16) & 0xFF,
-    (timestamp >> 8) & 0xFF,
-    timestamp & 0xFF,
-    0,
+  const data = buildTimePayload(Math.round(localWallClockMs() / 1000), {
     mode,
-    partialClock ? 1 : 0
-  ]);
+    partial: partialClock,
+  });
   try {
   if (await write(EpdCmd.SET_TIME, data)) {
-    await delay(300);
-    const verify = await requestTimeSample();
-    if (verify) addLog(`设备时间回读确认：误差 ${verify.errorMs >= 0 ? '+' : ''}${verify.errorMs.toFixed(0)} ms`);
-    addLog(mode === 2 ? "已切换到时钟模式，正在刷新屏幕。" : "已切换到日历模式，正在刷新屏幕。");
+    const synchronizedSeconds = data.timestamp ?? Math.round(localWallClockMs() / 1000);
+    resolveTimeSample(synchronizedSeconds);
+    void requestTimeSample();
+    addLog(mode === 2 ? "已自动同步时间并切换到时钟模式，正在刷新屏幕。" : "已同步时间并切换到日历模式，正在刷新屏幕。");
     addLog("屏幕刷新完成前请不要操作。");
     if (status) status.textContent = mode === 2 ? '时钟模式已切换，屏幕刷新中...' : '日历模式已切换，屏幕刷新中...';
     return true;
@@ -547,6 +598,23 @@ async function syncTime(mode) {
   } finally {
     timeMeasurementBusy = false;
   }
+}
+
+async function syncConnectedDeviceTime() {
+  if (!epdCharacteristic || !gattServer?.connected || bootloaderMode) return false;
+  const targetSeconds = Math.round(localWallClockMs() / 1000);
+  const payload = buildTimePayload(targetSeconds, {
+    mode: deviceDisplayMode,
+    preserveMode: true,
+    ppm: appVersion >= 0x35 ? -2147483648 : 0,
+  });
+  const success = await write(EpdCmd.SET_TIME, payload, true);
+  if (success) {
+    resolveTimeSample(targetSeconds);
+    addLog('连接对时已完成，当前显示模式保持不变');
+    void requestTimeSample();
+  }
+  return success;
 }
 
 function localUnixSeconds() {
@@ -951,6 +1019,27 @@ function armSlotActionTimeout() {
   }, 180000);
 }
 
+function scheduleSlotRefreshRetry(delayMs = 30000) {
+  if (slotRefreshRetryTimer || slotRefreshRetryAttempted || !gattServer ||
+      !gattServer.connected || bootloaderMode) return;
+  slotRefreshRetryTimer = setTimeout(async () => {
+    slotRefreshRetryTimer = null;
+    if (!slotRefreshPendingAfterDisplay || !gattServer || !gattServer.connected ||
+        bootloaderMode || imageTransferBusy || otaBusy) return;
+    slotRefreshRetryAttempted = true;
+    await refreshSlots(slotState.pageStart);
+  }, delayMs);
+}
+
+function shouldRefreshSlotsAfterNotification(msg) {
+  return msg.startsWith('slot=saved ') || msg === 'slot=deleted' ||
+    msg === 'slot=cleared' || msg.startsWith('slide=');
+}
+
+function shouldLogDeviceNotification(msg) {
+  return msg !== 'display=done';
+}
+
 async function displayImageSlot(slot) {
   armSlotActionTimeout();
   slotActionPending = true; updateButtonStatus(); renderSlotGrid();
@@ -1217,26 +1306,27 @@ async function sendimg(options = {}) {
   }
 
   let transferOk = true;
+  const imageTransferStats = { startedAt: performance.now(), sentBytes: 0 };
 
   if (ditherMode === 'threeColor') {
     const halfLength = Math.floor(processedData.length / 2);
     const blackWhiteData = processedData.slice(0, halfLength);
     const redWhiteData = processedData.slice(halfLength);
     if (['08', '09', '0e', '0f'].includes(epdDriverSelect.value)) {
-      transferOk = await writeImage(convertUC8159(blackWhiteData, redWhiteData), 'bw');
+      transferOk = await writeImage(convertUC8159(blackWhiteData, redWhiteData), 'bw', imageTransferStats);
     } else {
-      transferOk = await writeImage(blackWhiteData, 'bw');
-      if (transferOk && epoch === connectionEpoch) transferOk = await writeImage(redWhiteData, 'red');
+      transferOk = await writeImage(blackWhiteData, 'bw', imageTransferStats);
+      if (transferOk && epoch === connectionEpoch) transferOk = await writeImage(redWhiteData, 'red', imageTransferStats);
     }
   } else if (ditherMode === 'blackWhiteColor') {
     if (['08', '09', '0e', '0f'].includes(epdDriverSelect.value)) {
       const emptyData = new Uint8Array(processedData.length).fill(0xFF);
-      transferOk = await writeImage(convertUC8159(processedData, emptyData), 'bw');
+      transferOk = await writeImage(convertUC8159(processedData, emptyData), 'bw', imageTransferStats);
     } else {
-      transferOk = await writeImage(processedData, 'bw');
+      transferOk = await writeImage(processedData, 'bw', imageTransferStats);
     }
   } else if (ditherMode === 'fourColor' || ditherMode === 'sixColor') {
-    transferOk = await writeImage(processedData, 'bw');
+    transferOk = await writeImage(processedData, 'bw', imageTransferStats);
   } else {
     addLog("当前固件不支持此颜色模式。");
     updateButtonStatus();
@@ -1255,6 +1345,7 @@ async function sendimg(options = {}) {
       bleDevice?.gatt?.disconnect();
     return false;
   }
+  const dataTransferCompletedAt = performance.now();
 
   // Image transfers always use full refresh. Clock mode has its own SET_TIME flag.
   const refreshCommand = EpdCmd.REFRESH;
@@ -1273,8 +1364,10 @@ async function sendimg(options = {}) {
   updateButtonStatus();
 
   const sendTime = (new Date().getTime() - startTime) / 1000.0;
-  addLog(`${targetSlot != null ? '槽位数据发送完成' : '发送完成'}！耗时: ${sendTime}s`);
-  setStatus(targetSlot != null ? '图片已发送，正在校验并提交槽位...' : `发送完成！耗时: ${sendTime}s`);
+  const transferTime = Math.max(0.001, (dataTransferCompletedAt - imageTransferStats.startedAt) / 1000);
+  const averageSpeed = imageTransferStats.sentBytes / 1024 / transferTime;
+  addLog(`${targetSlot != null ? '槽位数据发送完成' : '图片传输完成'}：100% · 平均 ${averageSpeed.toFixed(1)} KiB/s · 传输耗时 ${transferTime.toFixed(1)} 秒 · 总耗时 ${sendTime.toFixed(1)} 秒`);
+  setStatus(targetSlot != null ? '图片已发送，正在校验并提交槽位...' : `发送完成！平均 ${averageSpeed.toFixed(1)} KiB/s，耗时 ${transferTime.toFixed(1)} 秒`);
   if (targetSlot == null || refreshAfterSave) addLog("屏幕刷新完成前请不要操作。");
   setTimeout(() => {
     status.parentElement.style.display = "none";
@@ -1381,13 +1474,18 @@ function toggleOtaPanel() {
 function disconnect() {
   const wasBootloader = bootloaderMode;
   const otaRestartExpected = otaFinalizing || otaCompletedAwaitingRestart;
+  const otaBootloaderTransitionExpected = otaEnteringBootloader;
   const activationRestart = activationSubmitPending || activationResetExpected;
   activationSubmitPending = false;
   activationResetExpected = false;
   resetVariables();
   updateButtonStatus();
   addLog('已断开连接.');
-  if (otaRestartExpected) {
+  if (otaBootloaderTransitionExpected) {
+    setOtaProgress(0);
+    setOtaStatus('设备已进入 Bootloader OTA；点击连接并选择 Bootloader_OTA，然后再次点击开始升级', 'success');
+    addLog('设备已切换到 Bootloader OTA，请点击连接并选择 Bootloader_OTA 继续升级');
+  } else if (otaRestartExpected) {
     otaVerificationPending = true;
     setOtaProgress(100);
     setOtaStatus('OTA 传输已完成，设备正在重启并校验激活状态', 'success');
@@ -1537,6 +1635,9 @@ function handleNotify(value, idx) {
     epdpins.value = bytes2hex(data.slice(0, 7));
     if (data.length > 10) epdpins.value += bytes2hex(data.slice(10, 11));
     const reportedDriver = bytes2hex(data.slice(7, 8));
+    if (data.length > 11 && (data[11] === 1 || data[11] === 2)) {
+      deviceDisplayMode = data[11];
+    }
     if (epddriver.querySelector(`option[value="${reportedDriver}"]`)) {
       // The firmware reports the physical controller id (14).  Keep the
       // user's explicit UC8276 partial/full choice instead of collapsing
@@ -1568,13 +1669,17 @@ function handleNotify(value, idx) {
     const logMessage = msg.startsWith('activation=')
       ? (msg.startsWith('activation=1') ? '设备已激活' : '设备未激活')
       : msg;
-    addLog(logMessage, '⇓');
+    if (shouldLogDeviceNotification(msg)) addLog(logMessage, '⇓');
     if (msg === 'slot_v2=1 slot_stream=1') {
       slotStreamSupport = true;
       if (!imageTransferBusy) void refreshSlots(0);
     } else if (msg.startsWith('slots=')) {
       const parsed = parseSlotsMessage(msg);
       if (parsed) {
+        if (slotRefreshRetryTimer) clearTimeout(slotRefreshRetryTimer);
+        slotRefreshRetryTimer = null;
+        slotRefreshRetryAttempted = false;
+        slotRefreshPendingAfterDisplay = false;
         slotState = parsed;
         slotActionPending = false;
         document.getElementById('slotReadStatus').textContent = '槽位信息已更新';
@@ -1588,11 +1693,28 @@ function handleNotify(value, idx) {
         slotPrepareWait = null;
         resolve(true);
       }
-    } else if (msg.startsWith('slot=saved ') || msg === 'slot=deleted' || msg === 'slot=cleared' ||
-      msg === 'display=done' || msg.startsWith('slide=')) {
+    } else if (shouldRefreshSlotsAfterNotification(msg)) {
       slotActionPending = false;
       updateButtonStatus(); renderSlotGrid();
       void refreshSlots();
+    } else if (msg === 'display=done') {
+      // Clock/calendar redraws also report display=done every minute. They do
+      // not change external-Flash metadata and must not trigger GET_SLOTS.
+      if (slotActionPending) {
+        slotActionPending = false;
+        updateButtonStatus(); renderSlotGrid();
+      }
+      if (slotRefreshPendingAfterDisplay) {
+        slotRefreshPendingAfterDisplay = false;
+        slotRefreshRetryAttempted = false;
+        if (slotRefreshRetryTimer) clearTimeout(slotRefreshRetryTimer);
+        slotRefreshRetryTimer = null;
+        void refreshSlots(slotState.pageStart);
+      }
+    } else if (msg === 'slot=busy' && !slotActionPending && !slotReadState && !imageTransferBusy) {
+      document.getElementById('slotReadStatus').textContent = '屏幕刷新中，完成后自动读取外置 Flash';
+      slotRefreshPendingAfterDisplay = true;
+      scheduleSlotRefreshRetry();
     } else if ((msg.startsWith('slot=') && (msg.includes('error') ||
       msg === 'slot=busy' || msg === 'slot=unavailable')) || msg === 'img=invalid' ||
       (msg.startsWith('display=') && msg.includes('error'))) {
@@ -1673,7 +1795,7 @@ function handleNotify(value, idx) {
       if (autoSync) {
         activationReconnectSyncPending = false;
         addLog('激活状态已确认，正在自动同步时间');
-        void syncTime(1);
+        void syncConnectedDeviceTime();
       }
     } else if (msg.startsWith('locked=')) {
       setActivationPanelVisible(true);
@@ -1722,6 +1844,7 @@ async function connectInternal() {
     addLog("正在连接: " + bleDevice.name);
     gattServer = await bleDevice.gatt.connect();
     addLog('  找到 GATT Server');
+    addLog(`上位机版本: ${HOST_BUILD_ID}`);
   } catch (e) {
     console.error(e);
     if (e.message) addLog("connect: " + e.message);
@@ -1897,9 +2020,9 @@ function validateOtaPackage(bytes) {
 
   return {
     bytes,
-    transferBytes: bytes.slice(0, infoOffset + OTA_IMAGE_INFO_SIZE),
+    transferBytes: bytes,
     imageInfo: bytes.slice(infoOffset, infoOffset + OTA_IMAGE_INFO_SIZE),
-    checksum: byteSum(bytes.subarray(0, infoOffset + OTA_IMAGE_INFO_SIZE)),
+    checksum: byteSum(bytes),
   };
 }
 
@@ -2078,6 +2201,81 @@ async function sendReliableOtaPayload(firmware, targetAddress) {
   }
 }
 
+async function sendFastOtaPayload(firmware) {
+  const mtu = Number(document.getElementById('mtusize')?.value) || 244;
+  const chunkSize = Math.min(OTA_FAST_CHUNK_SIZE, Math.max(1, mtu - 3));
+  let sentPackets = 0;
+  const completed = waitForDfuSignal(
+    0xFF,
+    data => data.length >= 1 && data[0] === 1,
+    60000,
+  );
+
+  try {
+    for (let offset = 0; offset < firmware.length; offset += chunkSize) {
+      const chunk = firmware.subarray(offset, Math.min(offset + chunkSize, firmware.length));
+      await otaRxCharacteristic.writeValueWithoutResponse(chunk);
+      sentPackets++;
+      const written = offset + chunk.length;
+      setOtaProgress(7 + (written / firmware.length) * 90);
+      updateOtaMetrics(written);
+      setOtaStatus(`正在快速写入固件 ${(written / 1024).toFixed(1)} / ${(firmware.length / 1024).toFixed(1)} KiB`);
+      if (written < firmware.length && sentPackets % OTA_FAST_BURST_PACKETS === 0) {
+        await delay(OTA_FAST_BURST_PAUSE_MS);
+      }
+    }
+    await completed;
+  } catch (error) {
+    if (otaPendingSignal) {
+      clearTimeout(otaPendingSignal.timer);
+      otaPendingSignal = null;
+    }
+    throw error;
+  }
+}
+
+async function finishFastOta(otaPackage) {
+  const checksum = byteSum(otaPackage.bytes);
+  const endPayload = new Uint8Array(5);
+  endPayload[0] = 1;
+  writeUint32LE(endPayload, 1, checksum);
+  const response = await sendDfuRequest(DfuCmd.PROGRAM_END, endPayload, 30000);
+  const actualChecksum = response.length >= 5 ? readUint32LE(response, 1) : null;
+  if (response.length > 0 && response[0] === 1 &&
+      (actualChecksum === null || actualChecksum === checksum)) {
+    return { response, checksum };
+  }
+  const actualText = actualChecksum === null ? '设备未返回 Flash 校验值' :
+    `设备 Flash 累计 0x${actualChecksum.toString(16).padStart(8, '0')}`;
+  throw new Error(`OTA 命令 0x25 校验失败：主机 0x${checksum.toString(16).padStart(8, '0')}，${actualText}`);
+}
+
+async function enterBootloaderOtaMode() {
+  if (!bleDevice || !otaRxCharacteristic || !gattServer?.connected) {
+    throw new Error('当前应用 OTA 通道不可用');
+  }
+
+  const device = bleDevice;
+  const disconnected = new Promise(resolve => {
+    device.addEventListener('gattserverdisconnected', () => resolve(true), { once: true });
+  });
+  otaEnteringBootloader = true;
+  setOtaStatus('正在重启到 Bootloader OTA');
+  addLog('正在切换到 Bootloader OTA 模式');
+  await otaRxCharacteristic.writeValueWithoutResponse(
+    makeDfuFrame(DfuCmd.DFU_MODE_SET, Uint8Array.of(2))
+  );
+
+  const didDisconnect = await Promise.race([
+    disconnected,
+    delay(10000).then(() => false),
+  ]);
+  if (!didDisconnect) {
+    otaEnteringBootloader = false;
+    throw new Error('设备未能重启到 Bootloader OTA');
+  }
+}
+
 function setAdvancedDriverOptionsVisible(visible) {
   advancedDriverOptionsVisible = Boolean(visible);
   document.querySelectorAll('#epddriver option[data-advanced-driver="true"]').forEach((option) => {
@@ -2114,7 +2312,7 @@ async function startOtaUpgrade() {
   } else {
     // A generic Bootloader_OTA advertisement cannot be tied safely to the
     // previously selected application device when several units are nearby.
-    otaExpectedActivationState = null;
+    if (typeof otaExpectedActivationState !== 'boolean') otaExpectedActivationState = null;
   }
   const activationText = bootloaderMode ? '当前为 Bootloader 救援模式' :
     `当前设备${otaExpectedActivationState ? '已激活' : '未激活'}，升级后将自动复核`;
@@ -2145,44 +2343,59 @@ async function startOtaUpgrade() {
     // GET_INFO is followed directly by DFU_FW_INFO_GET in this target flow.
     const firmwareInfo = await expectDfuSuccess(DfuCmd.DFU_FW_INFO_GET);
     if (firmwareInfo.length < 5) throw new Error('设备返回的 OTA 暂存地址无效');
-    const reportedSaveAddress = readUint32LE(firmwareInfo, 1);
-    const targetAddress = bootloaderMode ? OTA_APPLICATION_ADDRESS : reportedSaveAddress;
-    if (!bootloaderMode && targetAddress !== OTA_SAVE_ADDRESS) {
-      throw new Error(`设备 OTA 暂存地址不匹配: 0x${targetAddress.toString(16).padStart(8, '0')}`);
+
+    if (!bootloaderMode) {
+      await enterBootloaderOtaMode();
+      return;
     }
 
-    const dfuMode = bootloaderMode ? 2 : 1;
-    await otaRxCharacteristic.writeValueWithoutResponse(makeDfuFrame(DfuCmd.DFU_MODE_SET, Uint8Array.of(dfuMode)));
+    const reportedSaveAddress = readUint32LE(firmwareInfo, 1);
+    const targetAddress = OTA_APPLICATION_ADDRESS;
+
+    await otaRxCharacteristic.writeValueWithoutResponse(
+      makeDfuFrame(DfuCmd.DFU_MODE_SET, Uint8Array.of(2))
+    );
     await delay(150);
 
     const startPayload = new Uint8Array(1 + OTA_IMAGE_INFO_SIZE);
     // Use the acknowledged DFU path for compatibility with the stable
     // bootloader implementation. Each flash block is confirmed before the
     // next block is sent.
-    startPayload[0] = 0;
+    startPayload[0] = 0x02;
     startPayload.set(otaSelectedPackage.imageInfo, 1);
     // In copy mode Goodix expects load_addr to point at the staging bank while
     // run_addr remains the final application address. Bootloader rescue writes
     // directly to the original application address in non-copy mode.
     writeUint32LE(startPayload, 1 + 12, targetAddress);
-    setOtaStatus(bootloaderMode ? '正在恢复应用固件' : '正在擦除 OTA 暂存区');
-    await expectDfuSuccess(DfuCmd.PROGRAM_START, startPayload, 60000);
-    addLog('OTA 擦除完成，开始逐块确认传输');
+    setOtaStatus('正在擦除应用固件区');
+    const eraseComplete = waitForDfuSignal(
+      DfuCmd.PROGRAM_START,
+      data => data.length >= 2 && data[0] === 1 && data[1] === 3,
+      60000,
+    );
+    await expectDfuSuccess(
+      DfuCmd.PROGRAM_START,
+      startPayload,
+      60000,
+      data => data.length >= 1 && (data[0] !== 1 || data[1] === 1),
+    );
+    await eraseComplete;
+    addLog('OTA 快速模式擦除完成，开始连续传输');
     setOtaProgress(7);
     otaTransferStats.transferStartedAt = performance.now();
     updateOtaMetrics(0);
 
+    // Goodix's official DFU master defines the image tail as 48 bytes and
+    // sends all of it: 40-byte image info plus eight trailing 0xFF bytes.
     const firmware = otaSelectedPackage.bytes;
-    await sendReliableOtaPayload(firmware, targetAddress);
+    await sendFastOtaPayload(otaSelectedPackage.bytes);
 
-    const endPayload = new Uint8Array(5);
-    endPayload[0] = 1;
-    writeUint32LE(endPayload, 1, otaSelectedPackage.checksum);
     setOtaStatus('正在校验固件并重启设备');
     otaFinalizing = true;
-    const endResponse = await expectDfuSuccess(DfuCmd.PROGRAM_END, endPayload, 30000);
+    const endResult = await finishFastOta(otaSelectedPackage);
+    const endResponse = endResult.response;
     otaFinalizing = false;
-    if (endResponse.length >= 5 && readUint32LE(endResponse, 1) !== otaSelectedPackage.checksum) {
+    if (endResponse.length >= 5 && readUint32LE(endResponse, 1) !== endResult.checksum) {
       throw new Error('设备返回的整包校验和不匹配');
     }
 
@@ -2373,6 +2586,35 @@ function getDitherSettings() {
     mode: document.getElementById('ditherMode').value,
     filter: document.getElementById('tgzFilter')?.value || 'none'
   };
+}
+
+function otaProgramEndChecksums(otaPackage) {
+  const bytes = otaPackage.bytes;
+  const infoOffset = bytes.length - OTA_TAIL_SIZE;
+  const binSize = new DataView(bytes.buffer, bytes.byteOffset + infoOffset, OTA_IMAGE_INFO_SIZE)
+    .getUint32(4, true);
+  return Array.from(new Set([
+    byteSum(bytes),
+    byteSum(bytes.subarray(0, bytes.length - 8)),
+    byteSum(bytes.subarray(0, binSize)),
+  ]));
+}
+
+async function finishOtaWithCompatibleChecksum(otaPackage) {
+  const candidates = otaProgramEndChecksums(otaPackage);
+  for (let index = 0; index < candidates.length; index++) {
+    const checksum = candidates[index];
+    const endPayload = new Uint8Array(5);
+    endPayload[0] = 1;
+    writeUint32LE(endPayload, 1, checksum);
+    addLog(`OTA 结束校验 ${index + 1}/${candidates.length}：0x${checksum.toString(16).padStart(8, '0')}`);
+    const response = await sendDfuRequest(DfuCmd.PROGRAM_END, endPayload, 30000);
+    if (response.length > 0 && response[0] === 1) return { response, checksum };
+    if (response.length === 0 || response[0] !== 2) {
+      throw new Error(`OTA 命令 0x25 返回异常状态 ${response[0] ?? '空'}`);
+    }
+  }
+  throw new Error('OTA 命令 0x25 校验失败：设备拒绝完整尾部、40 字节信息和应用校验值');
 }
 
 function resetDitherPreviewSource() {
@@ -2862,4 +3104,5 @@ if (typeof module !== 'undefined') module.exports.__slotProtocolTest = {
   assembleSlotChunk,
   createSerialQueue,
   shouldSyncAfterActivation,
+  buildTimePayload,
 };

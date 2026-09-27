@@ -137,8 +137,6 @@
 						<span id="ledBrightnessValue">100%</span>
 					</div>
 					<button id="otaToggleButton" type="button" class="secondary" aria-expanded="false" aria-controls="otaPanel" onclick="toggleOtaPanel()">OTA 升级</button>
-					<button id="measureClockButton" type="button" class="secondary" onclick="measureDeviceClock()" title="连续读取设备时间并与电脑时钟比较">测量时钟误差</button>
-					<button id="calibrateClockButton" type="button" class="primary" onclick="calibrateDeviceTime()" title="将设备时间校准为当前电脑时间">校准设备时间</button>
 					<label class="manual-time-offset" for="manualTimeOffset">手动补偿</label>
 					<input id="manualTimeOffset" type="number" min="-60" max="60" step="1" value="0" title="相对电脑当前时间补偿，单位：秒">
 					<span>秒</span>
@@ -511,7 +509,7 @@
 	<script type="text/javascript" src="js/rle.js"></script>
 	<script type="text/javascript" src="js/paint.js?v=20260912-brush-eraser-toggle"></script>
 	<script type="text/javascript" src="js/crop.js?v=20260912-image-default-actions"></script>
-	<script type="text/javascript" src="js/main.js?v=20260915-driver-refresh-v2"></script>
+<script type="text/javascript" src="js/main.js?v=20260925-bootloader-fast-ota-v2"></script>
 	<script>
 		var _hmt = _hmt || [];
 		(function () {
