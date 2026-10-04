@@ -1,6 +1,6 @@
 (function () {
   'use strict';
-  var state = { images: [], layout: 'four-grid', selected: 0, drag: null, raf: 0, loading: false };
+  var state = { images: [], layout: 'four-grid', selected: 0, drag: null, raf: 0, dragRaf: 0, loading: false };
 
   function loadImage(file) {
     return new Promise(function (resolve, reject) {
@@ -68,6 +68,13 @@
       if (typeof paintManager.saveToHistory === 'function') paintManager.saveToHistory();
     }
   }
+  function renderDragFrame() {
+    if (state.dragRaf) return;
+    state.dragRaf = requestAnimationFrame(function () {
+      state.dragRaf = 0;
+      rawRender();
+    });
+  }
   function hitTest(x, y) {
     var canvas = document.getElementById('canvas'), layoutCells = cells(canvas.width, canvas.height);
     if (state.layout === 'diagonal') return (x / canvas.width + y / canvas.height <= 1) ? 0 : 1;
@@ -81,12 +88,13 @@
   function installCanvasEditing() {
     var canvas = document.getElementById('canvas'); if (!canvas || canvas.dataset.collageEditing) return;
     canvas.dataset.collageEditing = '1';
-    canvas.addEventListener('pointerdown', function (event) { if (!state.images.length) return; var p = pointerPosition(event, canvas), index = hitTest(p.x, p.y); if (index < 0) return; state.selected = index; state.drag = { x: p.x, y: p.y, lastX: p.x, lastY: p.y, dx: state.images[index].dx, dy: state.images[index].dy }; canvas.setPointerCapture(event.pointerId); event.preventDefault(); event.stopImmediatePropagation(); });
-    canvas.addEventListener('pointermove', function (event) { if (!state.drag) return; var p = pointerPosition(event, canvas), item = state.images[state.selected]; state.drag.lastX = p.x; state.drag.lastY = p.y; item.dx = state.drag.dx + p.x - state.drag.x; item.dy = state.drag.dy + p.y - state.drag.y; render(false); updateSelectedLabel(); event.preventDefault(); event.stopImmediatePropagation(); });
+    canvas.addEventListener('pointerdown', function (event) { if (!state.images.length) return; var p = pointerPosition(event, canvas), index = hitTest(p.x, p.y); if (index < 0) return; if (state.raf) { cancelAnimationFrame(state.raf); state.raf = 0; } state.selected = index; state.drag = { x: p.x, y: p.y, lastX: p.x, lastY: p.y, dx: state.images[index].dx, dy: state.images[index].dy }; canvas.setPointerCapture(event.pointerId); event.preventDefault(); event.stopImmediatePropagation(); });
+    canvas.addEventListener('pointermove', function (event) { if (!state.drag) return; var p = pointerPosition(event, canvas), item = state.images[state.selected]; state.drag.lastX = p.x; state.drag.lastY = p.y; item.dx = state.drag.dx + p.x - state.drag.x; item.dy = state.drag.dy + p.y - state.drag.y; renderDragFrame(); updateSelectedLabel(); event.preventDefault(); event.stopImmediatePropagation(); });
     canvas.addEventListener('pointerup', function (event) {
       if (!state.drag) return;
       var from = state.selected, to = hitTest(state.drag.lastX, state.drag.lastY);
       state.drag = null;
+      if (state.dragRaf) { cancelAnimationFrame(state.dragRaf); state.dragRaf = 0; }
       if (to >= 0 && to !== from && to < state.images.length) {
         var moving = state.images[from];
         state.images[from] = state.images[to];
@@ -97,7 +105,7 @@
       }
       render(true); updateSelectedLabel(); event.stopImmediatePropagation();
     });
-    canvas.addEventListener('pointercancel', function () { state.drag = null; });
+    canvas.addEventListener('pointercancel', function () { state.drag = null; if (state.dragRaf) { cancelAnimationFrame(state.dragRaf); state.dragRaf = 0; } });
     canvas.addEventListener('wheel', function (event) {
       if (!state.images.length) return;
       var p = pointerPosition(event, canvas), index = hitTest(p.x, p.y);
