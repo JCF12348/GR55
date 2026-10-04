@@ -5,7 +5,6 @@ let epdService, epdCharacteristic;
 let otaService, otaTxCharacteristic, otaRxCharacteristic, otaControlCharacteristic;
 let otaReceiveBuffer = new Uint8Array(0);
 let otaPendingResponse = null;
-let otaPendingSignal = null;
 let otaSelectedPackage = null;
 let otaBusy = false;
 let otaFinalizing = false;
@@ -29,6 +28,11 @@ let advancedDriverOptionsVisible = false;
 let paintManager, cropManager;
 let rleSupport;
 let ledEnabled = false;
+
+function is213DriverSelection() {
+  const option = document.getElementById('epddriver')?.selectedOptions?.[0];
+  return (option?.getAttribute('data-driver-id') || option?.value) === '13';
+}
 let batteryWarningLevel = 0;
 let lastBatteryStatus = null;
 let ledWriteChain = Promise.resolve();
@@ -52,7 +56,8 @@ let notificationCharacteristic = null;
 let displayWaiter = null;
 let lastDeviceTimeSample = null;
 let deviceDisplayMode = 1;
-const HOST_BUILD_ID = '20260925-bootloader-fast-ota-v2';
+const HOST_BUILD_ID = '20261004-image-rle-speed-v2';
+const DRIVER_SELECTION_STORAGE_KEY = 'epdSelectedDriver';
 
 // Firmware stores local wall-clock fields in a timezone-neutral timestamp.
 function localWallClockMs(date = new Date()) {
@@ -120,13 +125,7 @@ const OTA_TAIL_SIZE = 48;
 // MTU 244 leaves 241 ATT bytes. The DFU frame and PROGRAM_FLASH payload use
 // 15 bytes, so 226 bytes is the largest firmware chunk that fits one write.
 const OTA_CHUNK_SIZE = 226;
-// Fast DFU sends raw ATT payloads after erase; MTU 244 leaves 241 bytes.
-const OTA_FAST_CHUNK_SIZE = 241;
-// The bootloader drains its 5 KiB ring buffer in 1 KiB Flash writes. Browser
-// write-without-response completion only means the OS accepted the packet, so
-// keep bursts below 1 KiB and leave the peripheral time to drain each burst.
-const OTA_FAST_BURST_PACKETS = 4;
-const OTA_FAST_BURST_PAUSE_MS = 25;
+const OTA_FAST_CHUNK_SIZE = 240;
 const OTA_MAX_RESPONSE_PAYLOAD = 512;
 const OTA_ACTIVATION_MARKERS = ['locked=activation_required', 'activation=already'];
 
@@ -135,6 +134,9 @@ const DfuCmd = {
   PROGRAM_START: 0x23,
   PROGRAM_FLASH: 0x24,
   PROGRAM_END: 0x25,
+  // Fast DFU sends this unframed-data completion notification after the
+  // bootloader has drained its ring buffer and finished writing flash.
+  FAST_FLASH_DONE: 0xFF,
   SYSTEM_INFO: 0x27,
   DFU_MODE_SET: 0x41,
   DFU_FW_INFO_GET: 0x42,
@@ -377,11 +379,6 @@ function resetVariables() {
     otaPendingResponse.reject(error);
     otaPendingResponse = null;
   }
-  if (otaPendingSignal) {
-    clearTimeout(otaPendingSignal.timer);
-    otaPendingSignal.reject(new Error('蓝牙连接已断开'));
-    otaPendingSignal = null;
-  }
   gattServer = null;
   epdService = null;
   epdCharacteristic = null;
@@ -497,19 +494,29 @@ function imageTransferProgress(completedBytes, totalBytes, startedAt, now = perf
 
 async function writeImage(data, step = 'bw', transferStats = null) {
   const epoch = connectionEpoch;
-  const is213 = document.getElementById('epddriver')?.value === '13';
+  const is213 = is213DriverSelection();
   const configuredChunkSize = Number(document.getElementById('mtusize').value) - 2;
   const chunkSize = Math.max(1, Math.min(242, configuredChunkSize));
-  const configuredInterval = Number(document.getElementById('interleavedcount').value);
+  const configuredInterval = Number(document.getElementById('interleavedcount')?.value);
   /* Web Bluetooth resolves writeWithoutResponse once the browser has queued
    * the packet, not when the peripheral has consumed it.  Large bursts (the
    * old default was 50) overflow the GR5513 GATT TX queue and disconnect.
    * Keep the user setting as a hint, but never allow an unsafe burst. */
+  // Slot writes must be fully acknowledged.  The final SET_SLOT command is
+  // a commit/display barrier; allowing writeWithoutResponse packets before it
+  // can let the peripheral process the barrier before the last image bytes,
+  // which used to leave the GR5513 in an unfinished transaction and reset
+  // during the subsequent display refresh.
+  // Image streaming is deliberately acknowledged for every packet.  Unlike
+  // a small control command, a dropped image packet corrupts the frame and
+  // can make the firmware refresh invalid data.  This is slower than the
+  // unsafe no-response burst, but prevents GATT queue overflow and MCU resets
+  // on both direct images and slot transfers.
   const interleavedCount = is213 ? 0 : (Number.isFinite(configuredInterval)
-    ? Math.max(0, Math.min(50, Math.floor(configuredInterval))) : 0);
+    ? Math.max(0, Math.min(8, Math.floor(configuredInterval))) : 4);
   let noReplyCount = interleavedCount;
   let totalRleLength = 0;
-  const stepText = step === 'bw' ? '数据块' : '红色块';
+  const stepText = step === 'bw' ? '图像' : '颜色';
 
   // Use RLE only when its complete encoded stream is smaller than the
   // original data. Each RLE chunk contains complete codes.
@@ -519,6 +526,9 @@ async function writeImage(data, step = 'bw', transferStats = null) {
   const rleChunks = !is213 && rleSupport ? rleCompressMTU(data, chunkSize) : null;
   const rleLength = rleChunks ? rleChunks.reduce((total, chunk) => total + chunk.length, 0) : data.length;
   const useRle = rleSupport && rleLength < data.length;
+  if (useRle) addLog('RLE enabled: ' + (data.length / 1024).toFixed(1) + ' KiB -> ' + (rleLength / 1024).toFixed(1) + ' KiB');
+  else if (rleSupport && !is213) addLog('RLE skipped: compressed stream is not smaller');
+  else addLog(is213 ? 'Confirmed image transfer (2.13 compatibility mode)' : 'Confirmed image transfer');
   const totalChunks = useRle ? rleChunks.length : Math.ceil(data.length / chunkSize);
   let phaseBytes = 0;
 
@@ -1306,7 +1316,10 @@ async function sendimg(options = {}) {
   }
 
   let transferOk = true;
-  const imageTransferStats = { startedAt: performance.now(), sentBytes: 0 };
+  const imageTransferStats = {
+    startedAt: performance.now(),
+    sentBytes: 0,
+  };
 
   if (ditherMode === 'threeColor') {
     const halfLength = Math.floor(processedData.length / 2);
@@ -1341,7 +1354,7 @@ async function sendimg(options = {}) {
     // A failed 2.13 transfer can leave the peripheral in an unfinished
     // image transaction. Force a clean GATT session so the next attempt does
     // not inherit stale RAM/slot state.
-    if (epoch === connectionEpoch && document.getElementById('epddriver')?.value === '13')
+    if (epoch === connectionEpoch && is213DriverSelection())
       bleDevice?.gatt?.disconnect();
     return false;
   }
@@ -1376,7 +1389,7 @@ async function sendimg(options = {}) {
   } catch (error) {
     if (epoch === connectionEpoch && gattServer?.connected) {
       await write(EpdCmd.SET_SLOT, encodeSlotAction(0, 0xFFFFFFFF));
-      if (document.getElementById('epddriver')?.value === '13') bleDevice?.gatt?.disconnect();
+      if (is213DriverSelection()) bleDevice?.gatt?.disconnect();
     }
     slotActionPending = false;
     setStatus('发送失败：' + (error.message || error));
@@ -1645,7 +1658,9 @@ function handleNotify(value, idx) {
       const current = epddriver.options[epddriver.selectedIndex];
       const keepPartial = reportedDriver === '14' && current &&
         current.value === '14-partial';
-      if (!keepPartial) epddriver.value = reportedDriver;
+      const keep213Choice = reportedDriver === '13' && current &&
+        (current.value === '13-partial' || current.value === '13');
+      if (!keepPartial && !keep213Choice) epddriver.value = reportedDriver;
       const driverNames = {
         '13': '2.13寸 UC8151D 横屏',
         '14': '4.2寸 UC8276 三色',
@@ -2114,33 +2129,12 @@ function handleOtaNotification(event) {
       otaPendingResponse = null;
       clearTimeout(pending.timer);
       pending.resolve(data);
-    } else if (otaPendingSignal && otaPendingSignal.command === command && otaPendingSignal.accept(data)) {
-      const signal = otaPendingSignal;
-      otaPendingSignal = null;
-      clearTimeout(signal.timer);
-      signal.resolve(data);
     } else if (command === DfuCmd.PROGRAM_START) {
       // Some GR5513 builds repeat the erase-complete notification; it is idempotent.
     } else {
       addLog(`OTA 收到未等待的响应: 0x${command.toString(16)}`);
     }
   }
-}
-
-function waitForDfuSignal(command, accept, timeoutMs = 30000) {
-  if (otaPendingSignal) throw new Error('上一条 OTA 状态通知尚未完成');
-  let resolveSignal;
-  let rejectSignal;
-  const response = new Promise((resolve, reject) => {
-    resolveSignal = resolve;
-    rejectSignal = reject;
-  });
-  const timer = setTimeout(() => {
-    if (otaPendingSignal && otaPendingSignal.command === command) otaPendingSignal = null;
-    rejectSignal(new Error(`OTA 状态 0x${command.toString(16)} 等待超时`));
-  }, timeoutMs);
-  otaPendingSignal = { command, accept, resolve: resolveSignal, reject: rejectSignal, timer };
-  return response;
 }
 
 async function sendDfuRequest(command, payload = new Uint8Array(0), timeoutMs = 10000, accept = null) {
@@ -2166,6 +2160,21 @@ async function sendDfuRequest(command, payload = new Uint8Array(0), timeoutMs = 
     otaPendingResponse = null;
     rejectResponse(e);
   }
+  return response;
+}
+
+function waitForDfuResponse(command, timeoutMs = 60000, accept = null) {
+  if (otaPendingResponse) throw new Error('上一条 OTA 命令尚未完成');
+  let resolveResponse;
+  let rejectResponse;
+  const response = new Promise((resolve, reject) => { resolveResponse = resolve; rejectResponse = reject; });
+  const timer = setTimeout(() => {
+    if (otaPendingResponse?.command === command) {
+      otaPendingResponse = null;
+      rejectResponse(new Error(`OTA 命令 0x${command.toString(16)} 响应超时`));
+    }
+  }, timeoutMs);
+  otaPendingResponse = { command, resolve: resolveResponse, reject: rejectResponse, timer, accept };
   return response;
 }
 
@@ -2201,45 +2210,47 @@ async function sendReliableOtaPayload(firmware, targetAddress) {
   }
 }
 
-async function sendFastOtaPayload(firmware) {
-  const mtu = Number(document.getElementById('mtusize')?.value) || 244;
-  const chunkSize = Math.min(OTA_FAST_CHUNK_SIZE, Math.max(1, mtu - 3));
-  let sentPackets = 0;
-  const completed = waitForDfuSignal(
-    0xFF,
-    data => data.length >= 1 && data[0] === 1,
-    60000,
-  );
-
-  try {
-    for (let offset = 0; offset < firmware.length; offset += chunkSize) {
-      const chunk = firmware.subarray(offset, Math.min(offset + chunkSize, firmware.length));
-      await otaRxCharacteristic.writeValueWithoutResponse(chunk);
-      sentPackets++;
-      const written = offset + chunk.length;
-      setOtaProgress(7 + (written / firmware.length) * 90);
-      updateOtaMetrics(written);
-      setOtaStatus(`正在快速写入固件 ${(written / 1024).toFixed(1)} / ${(firmware.length / 1024).toFixed(1)} KiB`);
-      if (written < firmware.length && sentPackets % OTA_FAST_BURST_PACKETS === 0) {
-        await delay(OTA_FAST_BURST_PAUSE_MS);
-      }
-    }
-    await completed;
-  } catch (error) {
-    if (otaPendingSignal) {
-      clearTimeout(otaPendingSignal.timer);
-      otaPendingSignal = null;
-    }
-    throw error;
+async function sendFastOtaPayload(firmware, targetAddress) {
+  if (!otaRxCharacteristic) throw new Error('OTA 写入通道不可用');
+  // The official GR551x fast-Dfu port does not acknowledge each raw packet.
+  // Once the ring buffer has been drained and the last flash write completes,
+  // it sends a framed command 0xFF with payload byte 0x01.  Waiting for 0x24
+  // here is incorrect: 0x24 is the normal (non-fast) framed write command.
+  // Sending PROGRAM_END before this 0xFF notification races the background
+  // flash writer and reliably produces a 0x25 timeout.
+  const completed = waitForDfuResponse(DfuCmd.FAST_FLASH_DONE, 120000,
+    data => data.length >= 1 && data[0] === 0x01);
+  for (let offset = 0; offset < firmware.length; offset += OTA_FAST_CHUNK_SIZE) {
+      const end = Math.min(offset + OTA_FAST_CHUNK_SIZE, firmware.length);
+      const packet = firmware.subarray(offset, end);
+    // Fast DFU is the official ring-buffer path: after PROGRAM_START has
+    // erased the destination, it receives raw image bytes (no DG frame and no
+    // per-packet ACK).  A short yield keeps Chrome's ATT queue below the
+    // controller's receive buffer while retaining the speed advantage.
+    await otaRxCharacteristic.writeValueWithoutResponse(packet);
+    const written = end;
+    setOtaProgress(7 + (written / firmware.length) * 90);
+    updateOtaMetrics(written);
+    setOtaStatus(`正在快速写入固件 ${(written / 1024).toFixed(1)} / ${(firmware.length / 1024).toFixed(1)} KiB`);
+    // writeWithoutResponse only means that Chrome queued the ATT packet.  A
+    // short, bounded gap prevents the browser/controller queue from filling
+    // faster than the bootloader's flash/ring-buffer consumer.  This keeps
+    // the fast path reliable while remaining considerably faster than the
+    // acknowledged 0x24-per-block mode.
+    await delay(8);
   }
+  setOtaStatus('快速数据已发送，正在等待 Flash 写入完成');
+  await completed;
 }
 
-async function finishFastOta(otaPackage) {
+async function finishOta(otaPackage) {
   const checksum = byteSum(otaPackage.bytes);
   const endPayload = new Uint8Array(5);
   endPayload[0] = 1;
   writeUint32LE(endPayload, 1, checksum);
-  const response = await sendDfuRequest(DfuCmd.PROGRAM_END, endPayload, 30000);
+  // PROGRAM_END is sent only after FAST_FLASH_DONE, but flash checksum and
+  // image-info bookkeeping can still take several seconds on a full image.
+  const response = await sendDfuRequest(DfuCmd.PROGRAM_END, endPayload, 120000);
   const actualChecksum = response.length >= 5 ? readUint32LE(response, 1) : null;
   if (response.length > 0 && response[0] === 1 &&
       (actualChecksum === null || actualChecksum === checksum)) {
@@ -2291,6 +2302,22 @@ function initDriverSelector() {
   if (!selector) return;
   // Show the complete driver list in the normal UI.
   setAdvancedDriverOptionsVisible(true);
+  /* The UC8276 partial entry is a host-side alias of physical model 14.
+   * The firmware therefore reports 14 after every reboot, which used to
+   * make the page silently fall back to the full-refresh label.  Remember
+   * the user's selector choice; the configuration notification below still
+   * replaces it when the connected device is a different physical model. */
+  try {
+    const saved = window.localStorage.getItem(DRIVER_SELECTION_STORAGE_KEY);
+    if (saved && Array.from(selector.options).some(option => option.value === saved))
+      selector.value = saved;
+  } catch (error) {
+    /* Private browsing/storage-disabled environments should not block UI. */
+  }
+  selector.addEventListener('change', () => {
+    try { window.localStorage.setItem(DRIVER_SELECTION_STORAGE_KEY, selector.value); } catch (error) {}
+  });
+  updateDitcherOptions();
 }
 
 async function startOtaUpgrade() {
@@ -2349,50 +2376,35 @@ async function startOtaUpgrade() {
       return;
     }
 
-    const reportedSaveAddress = readUint32LE(firmwareInfo, 1);
     const targetAddress = OTA_APPLICATION_ADDRESS;
 
-    await otaRxCharacteristic.writeValueWithoutResponse(
-      makeDfuFrame(DfuCmd.DFU_MODE_SET, Uint8Array.of(2))
-    );
-    await delay(150);
-
     const startPayload = new Uint8Array(1 + OTA_IMAGE_INFO_SIZE);
-    // Use the acknowledged DFU path for compatibility with the stable
-    // bootloader implementation. Each flash block is confirmed before the
-    // next block is sent.
+    // Goodix dfu_port: 0x02 selects fast inner-flash mode.  The response
+    // reports erase-start/progress/end events; data is sent raw only after the
+    // erase-end event.
     startPayload[0] = 0x02;
     startPayload.set(otaSelectedPackage.imageInfo, 1);
-    // In copy mode Goodix expects load_addr to point at the staging bank while
-    // run_addr remains the final application address. Bootloader rescue writes
-    // directly to the original application address in non-copy mode.
     writeUint32LE(startPayload, 1 + 12, targetAddress);
     setOtaStatus('正在擦除应用固件区');
-    const eraseComplete = waitForDfuSignal(
-      DfuCmd.PROGRAM_START,
-      data => data.length >= 2 && data[0] === 1 && data[1] === 3,
-      60000,
-    );
     await expectDfuSuccess(
       DfuCmd.PROGRAM_START,
       startPayload,
-      60000,
-      data => data.length >= 1 && (data[0] !== 1 || data[1] === 1),
+      90000,
+      data => data.length >= 2 && data[0] === 1 && data[1] === 3,
     );
-    await eraseComplete;
-    addLog('OTA 快速模式擦除完成，开始连续传输');
+    addLog('OTA 擦除完成，开始快速连续传输');
     setOtaProgress(7);
     otaTransferStats.transferStartedAt = performance.now();
     updateOtaMetrics(0);
 
     // Goodix's official DFU master defines the image tail as 48 bytes and
-    // sends all of it: 40-byte image info plus eight trailing 0xFF bytes.
+    // sends all of it. Every 226-byte block is acknowledged before advancing.
     const firmware = otaSelectedPackage.bytes;
-    await sendFastOtaPayload(otaSelectedPackage.bytes);
+    await sendFastOtaPayload(firmware, targetAddress);
 
     setOtaStatus('正在校验固件并重启设备');
     otaFinalizing = true;
-    const endResult = await finishFastOta(otaSelectedPackage);
+    const endResult = await finishOta(otaSelectedPackage);
     const endResponse = endResult.response;
     otaFinalizing = false;
     if (endResponse.length >= 5 && readUint32LE(endResponse, 1) !== endResult.checksum) {
@@ -2413,10 +2425,6 @@ async function startOtaUpgrade() {
       setOtaStatus('OTA 传输已完成，设备正在重启；请重连确认版本', 'success');
       addLog('PROGRAM_END 已提交，断开属于设备重启阶段');
     } else {
-      if (otaPendingSignal) {
-        clearTimeout(otaPendingSignal.timer);
-        otaPendingSignal = null;
-      }
       otaFinalizing = false;
       setOtaStatus(`OTA 升级失败: ${e.message || e}`, 'error');
       addLog(`OTA 升级失败: ${e.message || e}`);
