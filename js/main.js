@@ -13,6 +13,8 @@ let otaTransferStats = null;
 let otaExpectedActivationState = null;
 let otaVerificationPending = false;
 let otaEnteringBootloader = false;
+let otaAwaitingBootloaderSelection = false;
+let otaAwaitingApplicationSelection = false;
 let deviceActivationState = null;
 let activationStateWaiters = [];
 let bootloaderMode = false;
@@ -24,6 +26,13 @@ let canvas, ctx, textDecoder;
 let ditherPreviewFrame = 0;
 let ditherSourceImageData = null;
 let ditherPreviewActive = false;
+// 外部图片编辑功能（例如拼图）写入画布后，清除旧的抖动预览缓存。
+if (typeof window !== 'undefined') {
+  window.resetDitherPreviewState = function () {
+    ditherSourceImageData = null;
+    ditherPreviewActive = false;
+  };
+}
 let advancedDriverOptionsVisible = false;
 let paintManager, cropManager;
 let rleSupport;
@@ -56,7 +65,7 @@ let notificationCharacteristic = null;
 let displayWaiter = null;
 let lastDeviceTimeSample = null;
 let deviceDisplayMode = 1;
-const HOST_BUILD_ID = '20261004-image-rle-speed-v2';
+const HOST_BUILD_ID = '20261005-image-rle-speed-v3';
 const DRIVER_SELECTION_STORAGE_KEY = 'epdSelectedDriver';
 
 // Firmware stores local wall-clock fields in a timezone-neutral timestamp.
@@ -438,7 +447,10 @@ async function write(cmd, data, withResponse = true) {
       try {
         if (withResponse) await characteristic.writeValueWithResponse(bytes);
         else await characteristic.writeValueWithoutResponse(bytes);
-        if (!withResponse) await delay(4);
+        // Image streaming on the negotiated large-MTU/RLE path can use a
+        // shorter pacing gap; keep the conservative delay for control and
+        // legacy 2.13 traffic.
+        if (!withResponse) await delay(cmd === EpdCmd.WRITE_IMG && rleSupport ? 2 : 4);
         return true;
       } catch (e) {
         const message = String(e?.message || e);
@@ -512,8 +524,10 @@ async function writeImage(data, step = 'bw', transferStats = null) {
   // can make the firmware refresh invalid data.  This is slower than the
   // unsafe no-response burst, but prevents GATT queue overflow and MCU resets
   // on both direct images and slot transfers.
+  const fastImagePath = !is213 && rleSupport && chunkSize >= 100;
   const interleavedCount = is213 ? 0 : (Number.isFinite(configuredInterval)
-    ? Math.max(0, Math.min(8, Math.floor(configuredInterval))) : 4);
+    ? Math.max(0, Math.min(fastImagePath ? 16 : 8, Math.floor(configuredInterval)))
+    : (fastImagePath ? 12 : 4));
   let noReplyCount = interleavedCount;
   let totalRleLength = 0;
   const stepText = step === 'bw' ? '图像' : '颜色';
@@ -526,7 +540,7 @@ async function writeImage(data, step = 'bw', transferStats = null) {
   const rleChunks = !is213 && rleSupport ? rleCompressMTU(data, chunkSize) : null;
   const rleLength = rleChunks ? rleChunks.reduce((total, chunk) => total + chunk.length, 0) : data.length;
   const useRle = rleSupport && rleLength < data.length;
-  if (useRle) addLog('RLE enabled: ' + (data.length / 1024).toFixed(1) + ' KiB -> ' + (rleLength / 1024).toFixed(1) + ' KiB');
+  if (useRle) addLog('RLE enabled: ' + (data.length / 1024).toFixed(1) + ' KiB -> ' + (rleLength / 1024).toFixed(1) + ' KiB' + (fastImagePath ? ' · 快速传图' : ''));
   else if (rleSupport && !is213) addLog('RLE skipped: compressed stream is not smaller');
   else addLog(is213 ? 'Confirmed image transfer (2.13 compatibility mode)' : 'Confirmed image transfer');
   const totalChunks = useRle ? rleChunks.length : Math.ceil(data.length / chunkSize);
@@ -1484,6 +1498,49 @@ function toggleOtaPanel() {
   button.textContent = panel.hidden ? 'OTA 升级' : '收起 OTA';
 }
 
+async function requestOtaDeviceSelection(kind) {
+  const bootloader = kind === 'bootloader';
+  // The previous BluetoothRemoteGATTDevice represents the old mode and must
+  // not be reused. A fresh chooser also prevents the post-OTA check from
+  // accidentally reconnecting to a generic Bootloader_OTA advertisement.
+  bleDevice = null;
+  gattServer = null;
+  otaAwaitingBootloaderSelection = bootloader;
+  otaAwaitingApplicationSelection = !bootloader;
+  setOtaStatus(bootloader
+    ? '设备已进入 Bootloader OTA，请选择 Bootloader_OTA 连接'
+    : 'OTA 已完成，请选择 GR_EPD 应用设备确认升级结果', 'success');
+  addLog(bootloader
+    ? '请在弹出的设备列表选择 Bootloader_OTA'
+    : '请在弹出的设备列表选择 GR_EPD 应用设备确认 OTA 结果');
+  try {
+    const filters = bootloader
+      ? [{ name: 'Bootloader_OTA' }]
+      : [{ namePrefix: 'GR_EPD_' }];
+    const selected = await navigator.bluetooth.requestDevice({
+      filters,
+      optionalServices: ['62750001-d828-918d-fb46-b6c11c675aec', OTA_SERVICE_UUID],
+    });
+    bleDevice = selected;
+    otaAwaitingBootloaderSelection = false;
+    otaAwaitingApplicationSelection = false;
+    bleDevice.addEventListener('gattserverdisconnected', disconnect);
+    setTimeout(async () => {
+      await connect();
+      if (!bootloader && otaVerificationPending) await confirmOtaAfterReset(1);
+    }, 150);
+  } catch (error) {
+    console.error(error);
+    if (error?.message) addLog(`requestDevice: ${error.message}`);
+    setOtaStatus(bootloader
+      ? '请选择连接并选择 Bootloader_OTA 继续升级'
+      : 'OTA 已完成，请点击连接并选择 GR_EPD 设备确认结果', 'error');
+    addLog(bootloader
+      ? '未选择 Bootloader_OTA；可点击连接后重新选择继续升级'
+      : '未选择应用设备；可点击连接后选择 GR_EPD 设备确认 OTA 结果');
+  }
+}
+
 function disconnect() {
   const wasBootloader = bootloaderMode;
   const otaRestartExpected = otaFinalizing || otaCompletedAwaitingRestart;
@@ -1498,12 +1555,19 @@ function disconnect() {
     setOtaProgress(0);
     setOtaStatus('设备已进入 Bootloader OTA；点击连接并选择 Bootloader_OTA，然后再次点击开始升级', 'success');
     addLog('设备已切换到 Bootloader OTA，请点击连接并选择 Bootloader_OTA 继续升级');
+    // The application GATT object is no longer usable after the mode switch.
+    // Open a fresh chooser for the bootloader instead of requiring the user
+    // to press Connect a second time.
+    setTimeout(() => requestOtaDeviceSelection('bootloader'), 120);
   } else if (otaRestartExpected) {
     otaVerificationPending = true;
     setOtaProgress(100);
     setOtaStatus('OTA 传输已完成，设备正在重启并校验激活状态', 'success');
     addLog('OTA 结束阶段设备已断开，按正常重启处理');
-    setTimeout(() => confirmOtaAfterReset(1), 1800);
+    // Do not reconnect the Bootloader_OTA device used for programming. The
+    // application has rebooted under its GR_EPD_* advertisement; ask the user
+    // to select that application device for the final verification.
+    setTimeout(() => requestOtaDeviceSelection('application'), 1800);
   } else if (otaSelectedPackage) {
     setOtaStatus('设备已断开，请重新扫描 GR_EPD 或 Bootloader_OTA 后继续升级');
     if (wasBootloader) addLog('Bootloader OTA 已断开，请重新扫描 Bootloader_OTA 继续救援');
@@ -1549,7 +1613,7 @@ function recordActivationState(active) {
 async function confirmOtaAfterReset(attempt) {
   if (!otaVerificationPending || !bleDevice) return;
   if (!gattServer || !gattServer.connected) {
-    addLog(`正在自动重连确认 OTA 结果（${attempt}/3）`);
+    addLog(`正在连接应用设备确认 OTA 结果（${attempt}/3）`);
     await connect();
   }
   if (gattServer && gattServer.connected && epdCharacteristic) {
@@ -1600,13 +1664,17 @@ async function preConnect() {
   else {
     resetVariables();
     try {
+      const filters = otaAwaitingBootloaderSelection
+        ? [{ name: 'Bootloader_OTA' }]
+        : (otaAwaitingApplicationSelection || otaVerificationPending)
+          ? [{ namePrefix: 'GR_EPD_' }]
+          : [{ namePrefix: 'GR_EPD_' }, { name: 'Bootloader_OTA' }];
       bleDevice = await navigator.bluetooth.requestDevice({
-        filters: [
-          { namePrefix: 'GR_EPD_' },
-          { name: 'Bootloader_OTA' },
-        ],
+        filters,
         optionalServices: ['62750001-d828-918d-fb46-b6c11c675aec', OTA_SERVICE_UUID],
       });
+      otaAwaitingBootloaderSelection = false;
+      otaAwaitingApplicationSelection = false;
     } catch (e) {
       console.error(e);
       if (e.message) addLog("requestDevice: " + e.message);
@@ -1619,7 +1687,10 @@ async function preConnect() {
     }
 
     await bleDevice.addEventListener('gattserverdisconnected', disconnect);
-    setTimeout(async function () { await connect(); }, 300);
+    setTimeout(async function () {
+      await connect();
+      if (otaVerificationPending && !bootloaderMode) await confirmOtaAfterReset(1);
+    }, 300);
   }
 }
 

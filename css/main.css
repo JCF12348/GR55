@@ -1871,3 +1871,8 @@ body.custom-background .log-container { background: rgba(24,33,44,.94); }
 @media (max-width: 640px) {
   .time-calibration-status { flex-basis: 100%; white-space: normal; }
 }
+
+.collage-controls { gap: 0.45rem; align-items: center; flex-wrap: wrap; }
+.collage-controls input[type="file"] { max-width: 22rem; }
+.collage-selected { min-height: 1.2rem; color: var(--muted-text, #667085); font-size: 0.82rem; }
+.collage-dither-toggle { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.85rem; }

@@ -6,7 +6,7 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>墨水屏日历</title>
 	<link rel="shortcut icon" type="image/png" href="favicon.png">
-	<link rel="stylesheet" href="css/main.css?v=20260915-preview-noise-fix">
+	<link rel="stylesheet" href="css/main.css?v=20260915-preview-noise-fix&rev=collage-editor">
 </head>
 
 	<body>
@@ -217,6 +217,23 @@
 			<div class="flex-container image-file-group">
 				<input type="file" id="imageFile" accept=".png,.jpg,.bmp,.webp,.jpeg" onchange="updateImage()">
 			</div>
+			<div class="flex-container image-file-group collage-controls">
+				<label for="collageFiles">拼图图片:</label>
+				<input type="file" id="collageFiles" accept=".png,.jpg,.bmp,.webp,.jpeg" multiple>
+				<select id="collageLayout" aria-label="拼图布局">
+					<option value="left-right">左右</option>
+					<option value="top-bottom">上下</option>
+					<option value="four-grid" selected>四宫格</option>
+					<option value="diagonal">对角</option>
+					<option value="three-horizontal">横向三宫格</option>
+					<option value="three-vertical">纵向三宫格</option>
+					<option value="six-grid">六宫格</option>
+					<option value="nine-grid">九宫格</option>
+				</select>
+				<button type="button" class="secondary" onclick="applyCollage()">生成拼图</button>
+			</div>
+			<div id="collageSelected" class="collage-selected" role="status">选择图片后可拖动，拖到其他区域可交换，滚轮缩放</div>
+			<label class="collage-dither-toggle"><input type="checkbox" id="collageDitherPreview" checked>实时抖动预览</label>
 			<div class="flex-container options image-options">
 				<div class="flex-group debug canvas-size-control">
 					<label for="canvasSize">画布尺寸:</label>
@@ -508,10 +525,10 @@
 	<script type="text/javascript" src="js/tgz-filters.js?v=20260915-tgz"></script>
 	<script type="text/javascript" src="js/tgz-dither-luts.js?v=20260915-tgz"></script>
 	<script type="text/javascript" src="js/dithering.js?v=20260915-tgz"></script>
-	<script type="text/javascript" src="js/rle.js"></script>
+	<script type="text/javascript" src="js/rle.js"></script><script type="text/javascript" src="js/collage.js?v=20261005-layout-all-images"></script>
 	<script type="text/javascript" src="js/paint.js?v=20260912-brush-eraser-toggle"></script>
 	<script type="text/javascript" src="js/crop.js?v=20260912-image-default-actions"></script>
-<script type="text/javascript" src="js/main.js?v=20261004-image-rle-speed-v2&rev=driver-selection-persist"></script>
+<script type="text/javascript" src="js/main.js?v=20261004-image-rle-speed-v2&rev=driver-selection-persist-image-fast-v3"></script>
 	<script>
 		var _hmt = _hmt || [];
 		(function () {
