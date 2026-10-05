@@ -524,10 +524,13 @@ async function writeImage(data, step = 'bw', transferStats = null) {
   // can make the firmware refresh invalid data.  This is slower than the
   // unsafe no-response burst, but prevents GATT queue overflow and MCU resets
   // on both direct images and slot transfers.
-  const fastImagePath = !is213 && rleSupport && chunkSize >= 100;
-  const interleavedCount = is213 ? 0 : (Number.isFinite(configuredInterval)
+  // 2.13 uses the same acknowledged/no-response cadence as 4.2.  Its raw
+  // compatibility payload still keeps the non-RLE header below, but forcing
+  // a response for every packet made the panel needlessly slow.
+  const fastImagePath = rleSupport && chunkSize >= 100;
+  const interleavedCount = Number.isFinite(configuredInterval)
     ? Math.max(0, Math.min(fastImagePath ? 16 : 8, Math.floor(configuredInterval)))
-    : (fastImagePath ? 12 : 4));
+    : (fastImagePath ? 12 : 4);
   let noReplyCount = interleavedCount;
   let totalRleLength = 0;
   const stepText = step === 'bw' ? '图像' : '颜色';
@@ -558,6 +561,12 @@ async function writeImage(data, step = 'bw', transferStats = null) {
       chunk = data.slice(off, off + chunkSize);
     }
 
+    // The 0x04 bit means RLE to the firmware.  When the device advertises
+    // rle=1, raw compatibility data (including all 2.13 UC8151D transfers)
+    // must still use the compact non-RLE header, with only the 0x04 bit
+    // added for an actually compressed chunk.  Sending the old 0x0F/F0
+    // header while rle=1 makes the firmware decode raw pixels as RLE and
+    // produces the exact striped/noisy screen seen on both panels.
     const payload = [
       rleSupport
         ? (step === 'bw' ? 0x00 : 0x01) | (i === 0 ? 0x02 : 0x00) | (useRle ? 0x04 : 0x00)
@@ -584,6 +593,9 @@ async function setDriver() {
   const selectedOption = driverSelect.options[driverSelect.selectedIndex];
   const driverId = selectedOption.getAttribute('data-driver-id') || driverSelect.value;
   await write(EpdCmd.SET_PINS, document.getElementById("epdpins").value);
+  // 2.13 UC8151D is restored to the original full-refresh protocol.  Do not
+  // send the removed partial-mode byte; old firmware treats it as a different
+  // command/session state and can corrupt the frame stream.
   await write(EpdCmd.INIT, driverId);
 }
 
@@ -1722,16 +1734,17 @@ function handleNotify(value, idx) {
     if (data.length > 11 && (data[11] === 1 || data[11] === 2)) {
       deviceDisplayMode = data[11];
     }
-    if (epddriver.querySelector(`option[value="${reportedDriver}"]`)) {
+    const reportedOption = epddriver.querySelector(`option[value="${reportedDriver}"]`) ||
+      epddriver.querySelector(`option[data-driver-id="${reportedDriver}"]`);
+    if (reportedOption) {
       // The firmware reports the physical controller id (14).  Keep the
       // user's explicit UC8276 partial/full choice instead of collapsing
       // the synthetic 14-partial option back to the full-refresh option.
       const current = epddriver.options[epddriver.selectedIndex];
       const keepPartial = reportedDriver === '14' && current &&
         current.value === '14-partial';
-      const keep213Choice = reportedDriver === '13' && current &&
-        (current.value === '13-partial' || current.value === '13');
-      if (!keepPartial && !keep213Choice) epddriver.value = reportedDriver;
+      if (!keepPartial)
+        epddriver.value = reportedDriver;
       const driverNames = {
         '13': '2.13寸 UC8151D 横屏',
         '14': '4.2寸 UC8276 三色',
@@ -1872,17 +1885,15 @@ function handleNotify(value, idx) {
     } else if (msg.startsWith('activation=')) {
       const active = msg.startsWith('activation=1');
       recordActivationState(active);
-      const autoSync = shouldSyncAfterActivation(msg, activationReconnectSyncPending);
       activationSubmitPending = false;
       activationResetExpected = false;
       document.getElementById('activationStatus').textContent = active ?
         '设备已激活' : msg.replace('activation=0 ', '设备未激活　');
       setActivationPanelVisible(!active);
-      if (autoSync) {
-        activationReconnectSyncPending = false;
-        addLog('激活状态已确认，正在自动同步时间');
-        void syncConnectedDeviceTime();
-      }
+      // Activation confirmation is informational only.  Connecting must not
+      // start a hidden SET_TIME/display refresh; the user can request time
+      // synchronization explicitly from the mode controls.
+      activationReconnectSyncPending = false;
     } else if (msg.startsWith('locked=')) {
       setActivationPanelVisible(true);
       document.getElementById('activationStatus').textContent = '设备未激活，当前功能已被固件拒绝';
@@ -2002,10 +2013,10 @@ async function connectInternal() {
   if (!bootloaderMode) {
     await write(EpdCmd.INIT);
     await write(EpdCmd.GET_STATUS);
-    // Treat every normal connection as a time-sync handshake.  The flag is
-    // consumed only by an activation=1 response, so locked devices are not
-    // sent time writes before activation.
-    activationReconnectSyncPending = true;
+    // A connection is read-only: do not force a display redraw or time write
+    // merely because the host connected.  Mode buttons and explicit time
+    // controls remain responsible for refreshing the panel.
+    activationReconnectSyncPending = false;
     await queryActivation();
     setTimeout(() => {
       if (gattServer && gattServer.connected && epdCharacteristic && !otaBusy) void write(EpdCmd.GET_STATUS);
@@ -2366,6 +2377,9 @@ function setAdvancedDriverOptionsVisible(visible) {
       option.hidden = !show;
       option.style.display = show ? '' : 'none';
   });
+  // UC8151D is exposed only through the validated partial-refresh entry.
+  // Keep legacy full-refresh aliases out of the selector while retaining
+  // the physical model id for configuration replies and image transfers.
 }
 
 function initDriverSelector() {
@@ -2562,6 +2576,9 @@ function setCanvasTitle(title) {
 
 function updateImage() {
   const imageFile = document.getElementById('imageFile');
+  // A normal single-image upload must never inherit the previous collage's
+  // pointer handlers, transforms, or image list on the shared canvas.
+  if (typeof window.resetCollage === 'function') window.resetCollage();
   resetDitherPreviewSource();
   if (imageFile.files.length == 0) {
     if (cropManager && cropManager.clearImage) cropManager.clearImage();
@@ -2643,6 +2660,7 @@ function rotateCanvas() {
 
 function clearCanvas() {
   if (confirm('清除画布内容?')) {
+    if (typeof window.resetCollage === 'function') window.resetCollage();
     fillCanvas('white');
     paintManager.clearElements(); // Clear stored text positions and line segments
     if (cropManager && cropManager.clearImage) cropManager.clearImage();
@@ -3143,6 +3161,43 @@ function ensureEditorCompatibilityControls() {
   }
 }
 
+function repairDisplaySelectors() {
+  const driver = document.getElementById('epddriver');
+  if (driver) {
+    driver.querySelectorAll('option[value="13"], option[value="13-partial"]').forEach(option => option.remove());
+    let full = document.createElement('option');
+    full.value = '13';
+    full.dataset.color = 'threeColor';
+    full.dataset.size = '2.13_250_122';
+    full.dataset.refreshMode = 'full';
+    full.textContent = '2.13寸（三色，UC8151D）';
+    const anchor = driver.querySelector('option[value="14"]');
+    driver.insertBefore(full, anchor || null);
+  }
+  const theme = document.getElementById('calendarTheme');
+  if (theme) {
+    const value = theme.value;
+    theme.innerHTML = [
+      ['0', '\u6807\u51c6\u5e03\u5c40'], ['1', '\u5206\u680f\u5927\u65e5\u5386'],
+      ['2', '\u7ecf\u5178\u6708\u5386'], ['3', '\u65e5\u671f\u53cc\u680f'],
+      ['4', '\u4e00\u5468\u7126\u70b9'], ['5', '\u6781\u7b80\u65e5\u5386'],
+    ].map(([id, label]) => `<option value="${id}">${label}</option>`).join('');
+    theme.value = /^([0-5])$/.test(value) ? value : '1';
+  }
+  const layout = document.getElementById('collageLayout');
+  if (layout) {
+    const value = layout.value;
+    layout.innerHTML = [
+      ['left-right', '\u5de6\u53f3'], ['top-bottom', '\u4e0a\u4e0b'],
+      ['four-grid', '\u56db\u5bab\u683c'], ['diagonal', '\u5bf9\u89d2'],
+      ['three-horizontal', '\u6a2a\u5411\u4e09\u5bab\u683c'],
+      ['three-vertical', '\u7ad6\u5411\u4e09\u5bab\u683c'],
+      ['six-grid', '\u516d\u5bab\u683c'], ['nine-grid', '\u4e5d\u5bab\u683c'],
+    ].map(([id, label]) => `<option value="${id}">${label}</option>`).join('');
+    layout.value = Array.from(layout.options).some(option => option.value === value) ? value : 'four-grid';
+  }
+}
+
 if (typeof document !== 'undefined') document.body.onload = () => {
   textDecoder = null;
   canvas = document.getElementById('canvas');
@@ -3152,6 +3207,7 @@ if (typeof document !== 'undefined') document.body.onload = () => {
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   ensureEditorCompatibilityControls();
+  repairDisplaySelectors();
   paintManager = new PaintManager(canvas, ctx);
   cropManager = new CropManager(canvas, ctx, paintManager);
   cropManager.setRenderCallback(renderTransformedImagePreview);

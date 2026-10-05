@@ -1,6 +1,27 @@
 (function () {
   'use strict';
-  var state = { images: [], layout: 'four-grid', selected: 0, drag: null, raf: 0, dragRaf: 0, loading: false };
+  // Collage editing is opt-in. The canvas is shared with normal image
+  // uploads, so pointer handlers must stay inert until a collage is loaded.
+  var state = { images: [], layout: 'four-grid', selected: 0, drag: null, raf: 0, dragRaf: 0, loading: false, active: false, loadToken: 0 };
+
+  function setCollageActive(active) {
+    state.active = !!active;
+    var canvas = document.getElementById('canvas');
+    if (canvas) canvas.dataset.collageEditing = state.active ? '1' : '0';
+    if (!state.active) {
+      state.drag = null;
+      if (state.dragRaf) { cancelAnimationFrame(state.dragRaf); state.dragRaf = 0; }
+    }
+  }
+
+  // The regular image picker calls this before loading a single image.
+  window.resetCollage = function () {
+    state.loadToken++;
+    state.images = [];
+    state.selected = 0;
+    setCollageActive(false);
+    updateSelectedLabel();
+  };
 
   function loadImage(file) {
     return new Promise(function (resolve, reject) {
@@ -86,12 +107,12 @@
   }
   function pointerPosition(event, canvas) { var rect = canvas.getBoundingClientRect(); return { x: (event.clientX - rect.left) * canvas.width / rect.width, y: (event.clientY - rect.top) * canvas.height / rect.height }; }
   function installCanvasEditing() {
-    var canvas = document.getElementById('canvas'); if (!canvas || canvas.dataset.collageEditing) return;
-    canvas.dataset.collageEditing = '1';
-    canvas.addEventListener('pointerdown', function (event) { if (!state.images.length) return; var p = pointerPosition(event, canvas), index = hitTest(p.x, p.y); if (index < 0) return; if (state.raf) { cancelAnimationFrame(state.raf); state.raf = 0; } state.selected = index; state.drag = { x: p.x, y: p.y, lastX: p.x, lastY: p.y, dx: state.images[index].dx, dy: state.images[index].dy }; canvas.setPointerCapture(event.pointerId); event.preventDefault(); event.stopImmediatePropagation(); });
-    canvas.addEventListener('pointermove', function (event) { if (!state.drag) return; var p = pointerPosition(event, canvas), item = state.images[state.selected]; state.drag.lastX = p.x; state.drag.lastY = p.y; item.dx = state.drag.dx + p.x - state.drag.x; item.dy = state.drag.dy + p.y - state.drag.y; renderDragFrame(); updateSelectedLabel(); event.preventDefault(); event.stopImmediatePropagation(); });
+    var canvas = document.getElementById('canvas'); if (!canvas) return;
+    setCollageActive(false);
+    canvas.addEventListener('pointerdown', function (event) { if (!state.active || !state.images.length) return; var p = pointerPosition(event, canvas), index = hitTest(p.x, p.y); if (index < 0) return; if (state.raf) { cancelAnimationFrame(state.raf); state.raf = 0; } state.selected = index; state.drag = { x: p.x, y: p.y, lastX: p.x, lastY: p.y, dx: state.images[index].dx, dy: state.images[index].dy }; canvas.setPointerCapture(event.pointerId); event.preventDefault(); event.stopImmediatePropagation(); });
+    canvas.addEventListener('pointermove', function (event) { if (!state.active || !state.drag) return; var p = pointerPosition(event, canvas), item = state.images[state.selected]; state.drag.lastX = p.x; state.drag.lastY = p.y; item.dx = state.drag.dx + p.x - state.drag.x; item.dy = state.drag.dy + p.y - state.drag.y; renderDragFrame(); updateSelectedLabel(); event.preventDefault(); event.stopImmediatePropagation(); });
     canvas.addEventListener('pointerup', function (event) {
-      if (!state.drag) return;
+      if (!state.active || !state.drag) return;
       var from = state.selected, to = hitTest(state.drag.lastX, state.drag.lastY);
       state.drag = null;
       if (state.dragRaf) { cancelAnimationFrame(state.dragRaf); state.dragRaf = 0; }
@@ -107,7 +128,7 @@
     });
     canvas.addEventListener('pointercancel', function () { state.drag = null; if (state.dragRaf) { cancelAnimationFrame(state.dragRaf); state.dragRaf = 0; } });
     canvas.addEventListener('wheel', function (event) {
-      if (!state.images.length) return;
+      if (!state.active || !state.images.length) return;
       var p = pointerPosition(event, canvas), index = hitTest(p.x, p.y);
       if (index < 0) return;
       state.selected = index;
@@ -122,16 +143,19 @@
     var input = document.getElementById('collageFiles'), layoutNode = document.getElementById('collageLayout'); if (!input) return;
     state.layout = layoutNode ? layoutNode.value : state.layout; var files = Array.prototype.slice.call(input.files || []), need = requiredCount();
     if (files.length < need) { if (typeof addLog === 'function') addLog('当前布局需要至少 ' + need + ' 张图片'); return; }
+    var loadToken = ++state.loadToken;
     state.loading = true;
     try {
       // Keep every selected image in memory. The current layout only renders
       // its required number of cells, so switching from the default four-grid
       // to six/nine-grid can reveal the remaining images immediately.
       var images = await Promise.all(files.map(loadImage));
+      if (loadToken !== state.loadToken) return;
       state.images = images.map(function (image) { return { image: image, scale: 1, dx: 0, dy: 0 }; });
       state.selected = 0;
+      setCollageActive(true);
       buildImageControls(); updateSelectedLabel(); render(false);
-    } catch (error) { if (typeof addLog === 'function') addLog('拼图预览失败：' + error.message); } finally { state.loading = false; }
+    } catch (error) { if (loadToken === state.loadToken && typeof addLog === 'function') addLog('拼图预览失败：' + error.message); } finally { if (loadToken === state.loadToken) state.loading = false; }
   }
   window.previewCollage = previewFromFiles;
   window.applyCollage = function () { if (!state.images.length) return previewFromFiles(); render(true); if (typeof addLog === 'function') addLog('拼图完成，可继续抖动并发送'); };
